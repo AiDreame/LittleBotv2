@@ -14,6 +14,10 @@ import {
 
 export const commands = [
   new Builder()
+    .setName("help")
+    .setDescription("List available commands and usage"),
+
+  new Builder()
     .setName("ping")
     .setDescription("Check if the bot is online"),
 
@@ -80,6 +84,29 @@ export const commands = [
 ];
 
 // ── Command Handlers ──
+
+function commandUsage(command: (typeof commands)[number]): string {
+  const data = command.toJSON();
+  const options = (data.options ?? [])
+    .map((option) => (option.required ? `<${option.name}>` : `[${option.name}]`))
+    .join(" ");
+  return `/${data.name}${options ? ` ${options}` : ""}`;
+}
+
+export async function handleHelp(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const lines = ["📖 **LittleBot Commands**", ""];
+  for (const command of commands) {
+    const data = command.toJSON();
+    lines.push(`**${commandUsage(command)}** — ${data.description}`);
+  }
+
+  await interaction.reply({
+    content: lines.join("\n"),
+    ephemeral: true,
+  });
+}
 
 export async function handlePing(
   interaction: ChatInputCommandInteraction,
@@ -368,6 +395,7 @@ const handlerMap: Record<
   string,
   (interaction: ChatInputCommandInteraction) => Promise<void>
 > = {
+  help: handleHelp,
   ping: handlePing,
   "set-channel": handleSetChannel,
   "remove-channel": handleRemoveChannel,
