@@ -158,6 +158,12 @@ export function getReportByMessageId(
     .get(messageId) as ReportWriteResult | undefined;
 }
 
+/** Return the number of reports already present, for import summaries. */
+export function getReportCount(): number {
+  const row = getDb().prepare("SELECT COUNT(*) AS count FROM reports").get() as { count: number };
+  return Number(row.count);
+}
+
 /**
  * Insert a parsed report into the database.
  */

@@ -8,6 +8,7 @@ import {
   getOrCreateChatter,
   insertReport,
   getReportByMessageId,
+  getReportCount,
   recordRawMessage,
   recordChatterEvent,
 } from "./db.js";
@@ -121,7 +122,7 @@ function newImportCounters(): ImportCounters {
 }
 
 function counterSummary(c: ImportCounters): string {
-  return `fetched=${c.fetched} scanned=${c.scanned} rawRetained=${c.rawRetained} parsedReports=${c.parsedReports} unsupported=${c.unsupported} duplicates=${c.duplicates} botMessages=${c.botMessages} errors=${c.errors}`;
+  return `fetched=${c.fetched} scanned=${c.scanned} rawRetained=${c.rawRetained} newlyImported=${c.imported} unsupported=${c.unsupported} duplicates=${c.duplicates} botMessages=${c.botMessages} errors=${c.errors}`;
 }
 
 function rawInputFor(message: Message): RawMessageInput {
@@ -538,6 +539,7 @@ export async function handleUpdateReports(
 
   // ── Discover all configured report channels ──
   const channelIds = getReportChannels(interaction.guildId);
+  const existingReports = getReportCount();
   console.log(
     `[update-reports] guild=${interaction.guildId} configuredChannels=${channelIds.length} limit=${limit}`,
   );
@@ -629,7 +631,7 @@ export async function handleUpdateReports(
     );
 
     perChannelLines.push(
-      `✅ <#${channel.id}> — fetched/scanned ${counters.fetched}/${counters.scanned}, raw ${counters.rawRetained}, parsed/imported ${counters.parsedReports}/${counters.imported}, unsupported ${counters.unsupported}, duplicates ${counters.duplicates}, bots ${counters.botMessages}, errors ${counters.errors}`,
+      `✅ <#${channel.id}> — fetched/scanned ${counters.fetched}/${counters.scanned}, raw retained ${counters.rawRetained}, newly imported ${counters.imported}, unsupported ${counters.unsupported}, existing duplicates ${counters.duplicates}, bots ${counters.botMessages}, errors ${counters.errors}`,
     );
   }
 
@@ -639,6 +641,7 @@ export async function handleUpdateReports(
     ...perChannelLines,
     "",
     `**Totals (${channelsOk} updated, ${channelsFailed} failed):** ${counterSummary(totals)}`,
+    `**Reports in database before scan:** ${existingReports}. **New reports imported:** ${totals.imported}.`,
   ];
   if (anyImportedOver50) {
     lines.push(
