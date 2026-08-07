@@ -41,12 +41,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await routeCommand(interaction);
   } catch (err) {
     console.error("Error handling command:", err);
-    // If we haven't replied yet, send an error
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({
-        content: "❌ An internal error occurred. Please try again.",
-        ephemeral: true,
-      }).catch(() => {});
+    // Always surface the failure. Commands that defer first (e.g. /backfill)
+    // must get an editReply, otherwise Discord reports "The application did
+    // not respond" and the user is left hanging for 15 minutes.
+    const message = "❌ An internal error occurred. Please try again.";
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: message }).catch(() => {});
+    } else {
+      await interaction
+        .reply({ content: message, ephemeral: true })
+        .catch(() => {});
     }
   }
 });

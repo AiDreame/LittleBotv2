@@ -261,9 +261,19 @@ export async function handleBackfill(
 
   // ── Fetch messages ──
   const textChannel = channel as TextChannel;
-  const messages = await textChannel.messages.fetch({
-    limit: Math.min(limit, 500),
-  });
+  let messages;
+  try {
+    messages = await textChannel.messages.fetch({
+      limit: Math.min(limit, 500),
+    });
+  } catch (err) {
+    console.error("Backfill message fetch failed:", err);
+    await interaction.editReply({
+      content:
+        "❌ Could not read message history in that channel. Make sure LittleBot has **Read Message History** permission there, then try again.",
+    });
+    return;
+  }
 
   let scanned = 0;
   let imported = 0;
