@@ -19,11 +19,56 @@ const client = new Client({
   ],
 });
 
+// ── Gateway Readiness & Health Logging (never logs the token) ──
+
+client.on(Events.ShardReady, (shardId) => {
+  console.log(`[gateway] shard ${shardId} ready`);
+});
+
+client.on(Events.ShardResume, (shardId, replayed) => {
+  console.log(
+    `[gateway] shard ${shardId} resumed — replayed ${replayed} events`,
+  );
+});
+
+client.on(Events.ShardReconnecting, (shardId) => {
+  console.warn(`[gateway] shard ${shardId} reconnecting…`);
+});
+
+client.on(Events.ShardDisconnect, (closeEvent, shardId) => {
+  const reason = closeEvent?.reason ? ` — "${closeEvent.reason}"` : "";
+  console.warn(
+    `[gateway] shard ${shardId} DISCONNECTED (code ${closeEvent?.code ?? "?"}${reason})`,
+  );
+});
+
+client.on(Events.ShardError, (error, shardId) => {
+  console.error(
+    `[gateway] shard ${shardId} error: ${error?.message ?? error}`,
+  );
+});
+
+client.on(Events.Invalidated, () => {
+  console.error(
+    "[gateway] Session INVALIDATED — Discord closed this session. The bot token may have been reset in the Developer Portal; the bot cannot come back online with this token.",
+  );
+});
+
+client.on(Events.Warn, (info) => {
+  console.warn(`[discord.js] warning: ${info}`);
+});
+
+client.on(Events.Error, (err) => {
+  console.error(`[discord.js] error: ${err?.message ?? err}`);
+});
+
 // ── Ready ──
 
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(
-    `LittleBot online — logged in as ${readyClient.user.tag}`,
+    `LittleBot online — logged in as ${readyClient.user.tag} ` +
+      `(bot id ${readyClient.user.id}, app id ${readyClient.application?.id ?? "?"}) ` +
+      `in ${readyClient.guilds.cache.size} guild(s), ws ping ${readyClient.ws.ping}ms`,
   );
 
   // Register slash commands with Discord
@@ -109,11 +154,44 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
 const token = process.env.DISCORD_TOKEN;
 
-if (token) {
-  await client.login(token);
-} else {
-  console.log(
-    "LittleBot online (no DISCORD_TOKEN — waiting for token)",
+// Non-secret preflight: ask Discord whether this token is even valid, and
+// which bot it belongs to. Never logs the token itself.
+async function verifyToken(tok: string): Promise<boolean> {
+  const rest = new REST({ version: "10" }).setToken(tok);
+  try {
+    const me = (await rest.get("/users/@me")) as {
+      id: string;
+      username: string;
+      discriminator?: string;
+    };
+    const tag =
+      me.discriminator && me.discriminator !== "0"
+        ? `${me.username}#${me.discriminator}`
+        : me.username;
+    console.log(`[token] DISCORD_TOKEN accepted — bot user ${tag} (id ${me.id})`);
+    return true;
+  } catch (err: any) {
+    console.error(
+      `[token] DISCORD_TOKEN REJECTED by Discord (HTTP ${err?.status ?? err?.code ?? "?"}${err?.message ? `: ${err.message}` : ""}). ` +
+        "The bot cannot go online with this token — reset the bot token in the Discord Developer Portal and restart with the new one.",
+    );
+    return false;
+  }
+}
+
+if (!token) {
+  console.error(
+    "No DISCORD_TOKEN in environment — the bot will NOT connect to Discord. Set DISCORD_TOKEN and restart.",
   );
-  console.log("Set DISCORD_TOKEN and restart to connect to Discord.");
+  process.exit(1);
+} else {
+  await verifyToken(token);
+  try {
+    await client.login(token);
+  } catch (err: any) {
+    console.error(
+      `Discord login failed: ${err?.message ?? err} — the bot is offline.`,
+    );
+    process.exit(1);
+  }
 }
