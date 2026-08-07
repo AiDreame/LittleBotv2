@@ -280,11 +280,35 @@ export async function handleBackfill(
 
   // Must be a text-based channel
   if (!("messages" in channel)) {
+    console.log(
+      `[backfill] ${interaction.guildId}: requested channel ${channel.id} ` +
+        `(name "${channel.name}", type ${channel.type}) is not text-based — aborting.`,
+    );
     await interaction.editReply({
       content: "❌ The selected channel must be a text channel.",
     });
     return;
   }
+
+  // ── Diagnostic logging (aggregate only — never message content) ──
+  // Records channel identity + the bot's permissions in it + fetch outcome so
+  // a "0 imported" result can be diagnosed from .run/bot.log alone.
+  const botPerms = channel.permissionsFor?.(interaction.client.user?.id);
+  const permFlags = {
+    viewChannel: !!botPerms?.has(PermissionFlagsBits.ViewChannel),
+    readMessageHistory: !!botPerms?.has(
+      PermissionFlagsBits.ReadMessageHistory,
+    ),
+    addReactions: !!botPerms?.has(PermissionFlagsBits.AddReactions),
+    manageGuild: !!interaction.memberPermissions?.has(
+      PermissionFlagsBits.ManageGuild,
+    ),
+  };
+  console.log(
+    `[backfill] guild=${interaction.guildId} channel=${channel.id} ` +
+      `name="${channel.name}" type=${channel.type} limit=${limit} ` +
+      `perms=${JSON.stringify(permFlags)}`,
+  );
 
   // ── Fetch messages ──
   // Discord's history endpoint returns at most 100 messages per request. A
@@ -313,10 +337,21 @@ export async function handleBackfill(
     });
     return;
   }
+  console.log(
+    `[backfill] guild=${interaction.guildId} channel=${channel.id} fetched=${messages.size} messages`,
+  );
 
   let scanned = 0;
   let imported = 0;
   let skipped = 0;
+  // Skip-reason breakdown (aggregate counters only — no content)
+  const skipReasons = {
+    botMessages: 0,
+    preFilter: 0,
+    parseFailed: 0,
+    alreadyImported: 0,
+    insertError: 0,
+  };
 
   for (const [, message] of messages) {
     scanned++;
@@ -324,12 +359,14 @@ export async function handleBackfill(
     // Skip bot messages
     if (message.author.bot) {
       skipped++;
+      skipReasons.botMessages++;
       continue;
     }
 
     // Quick pre-filter
     if (!looksLikeLogoutReport(message.content)) {
       skipped++;
+      skipReasons.preFilter++;
       continue;
     }
 
@@ -337,6 +374,7 @@ export async function handleBackfill(
     const parsed = parseLogoutMessage(message.content, message.createdAt);
     if (!parsed) {
       skipped++;
+      skipReasons.parseFailed++;
       continue;
     }
 
@@ -344,6 +382,7 @@ export async function handleBackfill(
     const existing = getReportByMessageId(message.id);
     if (existing) {
       skipped++;
+      skipReasons.alreadyImported++;
       continue;
     }
 
@@ -367,8 +406,15 @@ export async function handleBackfill(
         err,
       );
       skipped++;
+      skipReasons.insertError++;
     }
   }
+
+  console.log(
+    `[backfill] guild=${interaction.guildId} channel=${channel.id} ` +
+      `scanned=${scanned} imported=${imported} skipped=${skipped} ` +
+      `byReason=${JSON.stringify(skipReasons)}`,
+  );
 
   const lines = [
     "📊 **Backfill Complete**",
