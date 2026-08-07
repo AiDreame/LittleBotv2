@@ -7,6 +7,8 @@ analyticsRouter.get("/summary", (_req, res) => {
   const db = getDb();
   const sales = db.prepare(`SELECT COALESCE(SUM(reported_sales),0) sales, COALESCE(SUM(reported_tips),0) tips,
     COUNT(*) reports, COUNT(DISTINCT chatter_id) chatters, AVG(reported_sales) average_sale,
+    SUM(CASE WHEN reported_sales = 0 AND reported_tips = 0 THEN 1 ELSE 0 END) zero_earnings_reports,
+    SUM(CASE WHEN earnings_source = 'inferred_zero' THEN 1 ELSE 0 END) event_only_zero,
     COALESCE(SUM((julianday(shift_end)-julianday(shift_start))*24),0) shift_hours FROM reports`).get();
   const daily = db.prepare(`SELECT date(shift_start) date, SUM(reported_sales) sales, SUM(reported_tips) tips, COUNT(*) reports
     FROM reports GROUP BY date(shift_start) ORDER BY date DESC LIMIT 365`).all();

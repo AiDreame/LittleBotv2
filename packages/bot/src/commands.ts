@@ -117,16 +117,18 @@ export type ImportCounters = {
   errors: number;
   /** Chatter logout events recorded (reports + event-only messages). */
   logoutEvents: number;
-  /** Logout-marker messages kept raw with no report (no supported earnings). */
-  eventOnly: number;
+  /** Reports with zero sales, including explicit and inferred zero earnings. */
+  zeroEarningsReports: number;
+  /** Clear logout events converted to an inferred $0 report. */
+  eventOnlyZero: number;
 };
 
 export function newImportCounters(): ImportCounters {
-  return { fetched: 0, scanned: 0, imported: 0, rawRetained: 0, parsedReports: 0, unsupported: 0, duplicates: 0, botMessages: 0, errors: 0, logoutEvents: 0, eventOnly: 0 };
+  return { fetched: 0, scanned: 0, imported: 0, rawRetained: 0, parsedReports: 0, unsupported: 0, duplicates: 0, botMessages: 0, errors: 0, logoutEvents: 0, zeroEarningsReports: 0, eventOnlyZero: 0 };
 }
 
 export function counterSummary(c: ImportCounters): string {
-  return `fetched=${c.fetched} scanned=${c.scanned} rawRetained=${c.rawRetained} newlyImported=${c.imported} unsupported=${c.unsupported} duplicates=${c.duplicates} botMessages=${c.botMessages} errors=${c.errors} logoutEvents=${c.logoutEvents} eventOnly=${c.eventOnly}`;
+  return `fetched=${c.fetched} scanned=${c.scanned} rawRetained=${c.rawRetained} newlyImported=${c.imported} unsupported=${c.unsupported} duplicates=${c.duplicates} botMessages=${c.botMessages} errors=${c.errors} logoutEvents=${c.logoutEvents} zeroEarningsReports=${c.zeroEarningsReports} eventOnlyZero=${c.eventOnlyZero}`;
 }
 
 function rawInputFor(message: Message): RawMessageInput {
@@ -189,7 +191,7 @@ export async function importMessage(
       counters.errors++;
     }
 
-    // Supported earnings amount → sales report.
+    // Supported earnings amount, or a conservative inferred $0 for a clear logout → report.
     if (cls.kind === "report") {
       const existing = getReportByMessageId(message.id);
       if (existing) {
@@ -207,6 +209,10 @@ export async function importMessage(
         recordRawMessage(raw, "parsed", "imported");
         counters.parsedReports++;
         counters.imported++;
+        if (cls.report.reported_sales === 0 && cls.report.reported_tips === 0) {
+          counters.zeroEarningsReports++;
+          if (cls.report.earnings_source === "inferred_zero") counters.eventOnlyZero++;
+        }
 
         // React with ✅ on the imported message (cap to avoid rate limits)
         if (counters.imported <= maxReactions) {
@@ -220,11 +226,9 @@ export async function importMessage(
       return;
     }
 
-    // Logout marker without a supported earnings amount: the event above was
-    // recorded; the message stays raw and is explicitly classified.
+    // Defensive fallback; classifyLogoutMessage currently converts every clear marker to a report.
     recordRawMessage(raw, "unparsed", "logout_event_only_no_earnings");
     counters.unsupported++;
-    counters.eventOnly++;
     return;
   }
 
@@ -692,7 +696,7 @@ export async function handleUpdateReports(
       await importMessage(message, counters, 50);
     }
 
-    for (const key of ["fetched", "scanned", "imported", "rawRetained", "parsedReports", "unsupported", "duplicates", "botMessages", "errors", "logoutEvents", "eventOnly"] as const) totals[key] += counters[key];
+    for (const key of ["fetched", "scanned", "imported", "rawRetained", "parsedReports", "unsupported", "duplicates", "botMessages", "errors", "logoutEvents", "zeroEarningsReports", "eventOnlyZero"] as const) totals[key] += counters[key];
     channelsOk++;
     if (counters.imported > 50) anyImportedOver50 = true;
 
@@ -701,7 +705,7 @@ export async function handleUpdateReports(
     );
 
     perChannelLines.push(
-      `✅ <#${channel.id}> — ${limit === undefined ? "full history" : `bounded to ${limit} per channel`}; fetched/scanned ${counters.fetched}/${counters.scanned}, raw retained ${counters.rawRetained}, newly imported ${counters.imported}, logout events ${counters.logoutEvents} (event-only ${counters.eventOnly}), unsupported ${counters.unsupported}, existing duplicates ${counters.duplicates}, bots ${counters.botMessages}, errors ${counters.errors}`, 
+      `✅ <#${channel.id}> — ${limit === undefined ? "full history" : `bounded to ${limit} per channel`}; fetched/scanned ${counters.fetched}/${counters.scanned}, raw retained ${counters.rawRetained}, newly imported ${counters.imported}, logout events ${counters.logoutEvents} (zero reports ${counters.eventOnlyZero}), unsupported ${counters.unsupported}, existing duplicates ${counters.duplicates}, bots ${counters.botMessages}, errors ${counters.errors}`, 
     );
   }
 

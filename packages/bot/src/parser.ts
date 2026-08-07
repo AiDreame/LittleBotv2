@@ -206,11 +206,22 @@ export function classifyLogoutMessage(
   if (!LOGOUT_CMD_RE.test(content)) return { kind: "not_logout" };
 
   const earnings = extractEarnings(content);
+  const date = messageDate ?? new Date();
   if (earnings === null) {
-    return { kind: "event_only", reason: "no_supported_earnings" };
+    return {
+      kind: "report",
+      report: {
+        reported_sales: 0,
+        reported_tips: 0,
+        shift_start: formatShiftDate(date, "00:00"),
+        shift_end: formatShiftDate(date, "23:59"),
+        model_name: null,
+        earnings_source: "inferred_zero",
+      },
+    };
   }
 
-  const date = messageDate ?? new Date();
+
   return {
     kind: "report",
     report: {

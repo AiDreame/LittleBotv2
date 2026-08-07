@@ -71,6 +71,8 @@ export interface ParsedReport {
   shift_end: string;
   /** Only populated when the source explicitly labels a model; otherwise null. */
   model_name?: string | null;
+  /** Whether zero earnings were explicit or inferred from a clear logout without an amount. */
+  earnings_source?: "explicit" | "inferred_zero";
 }
 
 /** Result of writing a parsed report to the database */
@@ -83,4 +85,5 @@ export interface ReportWriteResult {
   shift_end: string;
   message_id: string;
   created_at: string;
+  earnings_source?: "explicit" | "inferred_zero";
 }

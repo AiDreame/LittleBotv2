@@ -97,6 +97,7 @@ function runMigrations(database: Database.Database): void {
       shift_start     TEXT NOT NULL,
       shift_end       TEXT NOT NULL,
       message_id      TEXT NOT NULL,
+      earnings_source TEXT NOT NULL DEFAULT 'explicit' CHECK (earnings_source IN ('explicit','inferred_zero')),
       created_at      TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -167,4 +168,9 @@ function runMigrations(database: Database.Database): void {
     database.exec("ALTER TABLE reports ADD COLUMN model_name TEXT");
   }
   database.exec("CREATE INDEX IF NOT EXISTS idx_reports_model ON reports(model_name)");
+  const earningsColumns = database.prepare("PRAGMA table_info(reports)").all() as Array<{name: string}>;
+  if (!earningsColumns.some((c) => c.name === "earnings_source")) {
+    database.exec("ALTER TABLE reports ADD COLUMN earnings_source TEXT NOT NULL DEFAULT 'explicit'");
+  }
+  database.exec("CREATE INDEX IF NOT EXISTS idx_reports_earnings_source ON reports(earnings_source)");
 }
