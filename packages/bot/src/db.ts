@@ -176,8 +176,8 @@ export function insertReport(
 
   const result = database
     .prepare(
-      `INSERT INTO reports (chatter_id, reported_sales, reported_tips, shift_start, shift_end, message_id)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO reports (chatter_id, reported_sales, reported_tips, shift_start, shift_end, message_id, model_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       chatterId,
@@ -186,6 +186,7 @@ export function insertReport(
       report.shift_start,
       report.shift_end,
       messageId,
+      report.model_name ?? null,
     );
 
   const inserted = database

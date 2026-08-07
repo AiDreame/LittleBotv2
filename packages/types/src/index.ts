@@ -25,6 +25,7 @@ export interface Report {
   shift_end: string; // ISO 8601
   message_id: string;
   created_at: string; // ISO 8601
+  model_name?: string | null;
 }
 
 /** Actual sales data pulled from the platform */
@@ -68,6 +69,8 @@ export interface ParsedReport {
   reported_tips: number;
   shift_start: string;
   shift_end: string;
+  /** Only populated when the source explicitly labels a model; otherwise null. */
+  model_name?: string | null;
 }
 
 /** Result of writing a parsed report to the database */

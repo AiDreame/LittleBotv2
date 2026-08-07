@@ -92,7 +92,7 @@ export const commands = [
     .addIntegerOption((opt) =>
       opt
         .setName("limit")
-        .setDescription("Maximum messages to scan per channel (default 100, max 5000)")
+        .setDescription("Optional bound per channel; omit to scan all available history")
         .setMinValue(1)
         .setMaxValue(5000)
         .setRequired(false),
@@ -218,19 +218,20 @@ async function importMessage(
  */
 async function fetchChannelHistory(
   channel: TextChannel,
-  limit: number,
+  limit?: number,
 ): Promise<Map<string, Message>> {
   const messages = new Map<string, Message>();
   let before: string | undefined;
-  while (messages.size < limit) {
+  while (limit === undefined || messages.size < limit) {
+    const remaining = limit === undefined ? 100 : Math.min(100, limit - messages.size);
     const page = await channel.messages.fetch({
-      limit: Math.min(100, limit - messages.size),
+      limit: remaining,
       ...(before ? { before } : {}),
     });
     if (page.size === 0) break;
     for (const [id, message] of page) messages.set(id, message);
     const oldest = page.last();
-    if (!oldest || page.size < Math.min(100, limit - (messages.size - page.size))) break;
+    if (!oldest || page.size < remaining) break;
     before = oldest.id;
   }
   return messages;
@@ -534,14 +535,13 @@ export async function handleUpdateReports(
     return;
   }
 
-  const limit =
-    interaction.options.getInteger("limit", false) ?? 100;
+  const limit = interaction.options.getInteger("limit", false) ?? undefined;
 
   // ── Discover all configured report channels ──
   const channelIds = getReportChannels(interaction.guildId);
   const existingReports = getReportCount();
   console.log(
-    `[update-reports] guild=${interaction.guildId} configuredChannels=${channelIds.length} limit=${limit}`,
+    `[update-reports] guild=${interaction.guildId} configuredChannels=${channelIds.length} scan=${limit === undefined ? "full_history" : `bounded_per_channel_${limit}`}`, 
   );
 
   if (channelIds.length === 0) {
@@ -631,7 +631,7 @@ export async function handleUpdateReports(
     );
 
     perChannelLines.push(
-      `✅ <#${channel.id}> — fetched/scanned ${counters.fetched}/${counters.scanned}, raw retained ${counters.rawRetained}, newly imported ${counters.imported}, unsupported ${counters.unsupported}, existing duplicates ${counters.duplicates}, bots ${counters.botMessages}, errors ${counters.errors}`,
+      `✅ <#${channel.id}> — ${limit === undefined ? "full history" : `bounded to ${limit} per channel`}; fetched/scanned ${counters.fetched}/${counters.scanned}, raw retained ${counters.rawRetained}, newly imported ${counters.imported}, unsupported ${counters.unsupported}, existing duplicates ${counters.duplicates}, bots ${counters.botMessages}, errors ${counters.errors}`, 
     );
   }
 

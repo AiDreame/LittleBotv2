@@ -51,7 +51,18 @@ analyticsRouter.get("/chatters", (_req, res) => {
   res.json({ chatters, daily, monthly });
 });
 
+analyticsRouter.get("/chatter/:discordId", (req, res) => {
+  const db = getDb();
+  const chatter = db.prepare(`SELECT id, discord_id, name FROM chatters WHERE discord_id = ?`).get(req.params.discordId) as {id:number; discord_id:string; name:string} | undefined;
+  if (!chatter) return res.status(404).json({ error: "Chatter not found" });
+  const summary = db.prepare(`SELECT COUNT(*) reports, COALESCE(SUM(reported_sales),0) sales, COALESCE(SUM(reported_tips),0) tips, AVG(reported_sales) average_sale, COALESCE(SUM((julianday(shift_end)-julianday(shift_start))*24),0) shift_hours FROM reports WHERE chatter_id=?`).get(chatter.id);
+  const models = db.prepare(`SELECT COALESCE(NULLIF(TRIM(model_name),''),'Unknown model') model_name, COUNT(*) reports, SUM(reported_sales) sales, SUM(reported_tips) tips, AVG(reported_sales) average_sale FROM reports WHERE chatter_id=? GROUP BY COALESCE(NULLIF(TRIM(model_name),''),'Unknown model') ORDER BY sales DESC`).all(chatter.id);
+  const daily = db.prepare(`SELECT date(shift_start) date, COUNT(*) reports, SUM(reported_sales) sales, SUM(reported_tips) tips FROM reports WHERE chatter_id=? GROUP BY date(shift_start) ORDER BY date DESC`).all(chatter.id);
+  const monthly = db.prepare(`SELECT strftime('%Y-%m',shift_start) month, COUNT(*) reports, SUM(reported_sales) sales, SUM(reported_tips) tips FROM reports WHERE chatter_id=? GROUP BY month ORDER BY month DESC`).all(chatter.id);
+  return res.json({ chatter, summary, models, daily, monthly });
+});
+
 analyticsRouter.get("/raw-status", (_req, res) => {
   const db = getDb();
-  res.json(db.prepare(`SELECT parse_status status, COALESCE(parse_reason,'') reason, COUNT(*) count FROM raw_messages GROUP BY parse_status, parse_reason ORDER BY count DESC`).all());
+  res.json({ statuses: db.prepare(`SELECT parse_status status, COALESCE(parse_reason,'') reason, COUNT(*) count FROM raw_messages GROUP BY parse_status, parse_reason ORDER BY count DESC`).all(), total_retained: (db.prepare("SELECT COUNT(*) count FROM raw_messages").get() as {count:number}).count });
 });

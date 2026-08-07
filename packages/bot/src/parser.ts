@@ -41,6 +41,13 @@ const EARNINGS_RE = /earnings?\s*[-:]\s*([\d,.]+)/i;
 
 // !logout format: message starts with !logout
 const LOGOUT_CMD_RE = /^!logout\b/im;
+// Conservative model extraction: only accept an explicit Model/Model name label.
+const MODEL_RE = /(?:model(?:\s+name)?|performer)\s*[:=-]\s*([^\n|,]+)/i;
+
+function extractModelName(text: string): string | null {
+  const value = text.match(MODEL_RE)?.[1]?.trim();
+  return value ? value.slice(0, 120) : null;
+}
 
 /**
  * Parse a number string that may use European comma-as-decimal.
@@ -191,6 +198,7 @@ export function parseLogoutMessage(
       reported_tips: 0,
       shift_start: formatShiftDate(date, "00:00"),
       shift_end: formatShiftDate(date, "23:59"),
+      model_name: extractModelName(content),
     };
   }
 
@@ -209,6 +217,7 @@ export function parseLogoutMessage(
     reported_tips: tips ?? 0,
     shift_start: normalizeTime(timeRange[0]),
     shift_end: normalizeTime(timeRange[1]),
+    model_name: extractModelName(content),
   };
 }
 
