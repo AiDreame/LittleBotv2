@@ -1,4 +1,4 @@
-import type { ChatInputCommandInteraction, Message, TextChannel, Channel } from "discord.js";
+import type { ChatInputCommandInteraction, Message, TextChannel, Channel, Collection } from "discord.js";
 import { REST, Routes, SlashCommandBuilder as Builder, PermissionFlagsBits, MessageFlags } from "discord.js";
 import { parseLogoutMessage, looksLikeLogoutReport, classifyLogoutMessage } from "./parser.js";
 import {
@@ -217,6 +217,7 @@ export async function importMessage(
         // React with ✅ on the imported message (cap to avoid rate limits)
         if (counters.imported <= maxReactions) {
           await message.react("✅").catch(() => {});
+          await sleep(100);
         }
       } catch (err) {
         console.error(`Error importing message ${message.id}:`, err);
@@ -273,6 +274,7 @@ export async function importMessage(
     // React with ✅ on the imported message (cap to avoid rate limits)
     if (counters.imported <= maxReactions) {
       await message.react("✅").catch(() => {});
+      await sleep(100);
     }
   } catch (err) {
     console.error(
@@ -284,31 +286,81 @@ export async function importMessage(
   }
 }
 
+// ── Scan job plumbing (shared by /backfill and /update-reports) ──
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** One active scan per guild so long scans can't pile up on the same DB. */
+const activeScanJobs = new Map<string, boolean>();
+
+/** Hard ceiling for any reply/status text (Discord's message limit is 2000). */
+const MAX_REPLY_CHARS = 1900;
+
 /**
- * Fetch up to `limit` messages from a text channel.
- * Discord's history endpoint returns at most 100 messages per request. A
- * single fetch({ limit }) therefore silently stops at the API page size;
- * walk backwards with `before` until the requested scan limit is reached.
+ * Walk a channel's history one 100-message page at a time, handing each page
+ * to `onPage` as it is fetched. Bounded scans stop at `limit`; unbounded scans
+ * walk the whole history. Only one page is ever held in memory at a time, and
+ * a short pause between pages keeps the messages-fetch rate-limit bucket in
+ * headroom (discord.js already backs off and retries on 429s).
  */
-async function fetchChannelHistory(
+async function walkHistoryPages(
   channel: TextChannel,
-  limit?: number,
-): Promise<Map<string, Message>> {
-  const messages = new Map<string, Message>();
+  limit: number | undefined,
+  onPage: (page: Collection<string, Message>) => Promise<void>,
+): Promise<void> {
   let before: string | undefined;
-  while (limit === undefined || messages.size < limit) {
-    const remaining = limit === undefined ? 100 : Math.min(100, limit - messages.size);
+  let fetched = 0;
+  while (limit === undefined || fetched < limit) {
+    const want = limit === undefined ? 100 : Math.min(100, limit - fetched);
     const page = await channel.messages.fetch({
-      limit: remaining,
+      limit: want,
       ...(before ? { before } : {}),
     });
     if (page.size === 0) break;
-    for (const [id, message] of page) messages.set(id, message);
+    await onPage(page);
+    fetched += page.size;
     const oldest = page.last();
-    if (!oldest || page.size < remaining) break;
+    if (!oldest || page.size < want) break;
     before = oldest.id;
+    await sleep(250);
   }
-  return messages;
+}
+
+/** Compact per-channel result line, kept short so 10+ channels fit in 2000 chars. */
+function channelResultLine(
+  ok: boolean,
+  channelId: string,
+  scopeLabel: string,
+  c: ImportCounters,
+): string {
+  if (!ok) return `❌ <#${channelId}> — ${scopeLabel} failed`;
+  return (
+    `✅ <#${channelId}> — ${scopeLabel}; fetched ${c.fetched}, ` +
+    `new ${c.imported}, dups ${c.duplicates}, logout ${c.logoutEvents}, ` +
+    `unsup ${c.unsupported}, err ${c.errors}`
+  );
+}
+
+/** Build a ≤2000-char final summary from per-channel lines plus totals. */
+function buildScanSummary(opts: {
+  title: string;
+  perChannel: string[];
+  channelsOk: number;
+  channelsFailed: number;
+  totals: ImportCounters;
+  existingReports: number;
+  note?: string;
+}): string {
+  const lines = [
+    opts.title,
+    "",
+    ...opts.perChannel,
+    "",
+    `**Totals (${opts.channelsOk} updated, ${opts.channelsFailed} failed):** ${counterSummary(opts.totals)}`,
+    `**Reports in database before scan:** ${opts.existingReports}. **New reports imported:** ${opts.totals.imported}.`,
+  ];
+  if (opts.note) lines.push("", opts.note);
+  return lines.join("\n").slice(0, MAX_REPLY_CHARS);
 }
 
 function commandUsage(command: (typeof commands)[number]): string {
@@ -536,29 +588,97 @@ export async function handleBackfill(
       `perms=${JSON.stringify(permFlags)}`,
   );
 
-  // ── Fetch messages ──
-  // Paginate backwards with `before` up to the requested scan limit (the
-  // history endpoint only returns 100 messages per request).
-  const textChannel = channel as TextChannel;
-  let messages: Map<string, Message>;
-  try {
-    messages = await fetchChannelHistory(textChannel, limit);
-  } catch (err) {
-    console.error("Backfill message fetch failed:", err);
+  // ── Scan concurrency guard ──
+  // One scan per guild at a time: concurrent scans would pile synchronous DB
+  // writes and reaction bursts on the same connection and rate-limit buckets.
+  if (activeScanJobs.get(interaction.guildId)) {
     await interaction.editReply({
       content:
-        "❌ Could not read message history in that channel. Make sure LittleBot has **Read Message History** permission there, then try again.",
+        "⏳ A report scan is already running in this server. Wait for it to finish, then try again.",
     });
     return;
   }
-  console.log(
-    `[backfill] guild=${interaction.guildId} channel=${channel.id} fetched=${messages.size} messages`,
-  );
+  activeScanJobs.set(interaction.guildId, true);
 
-  // Process each message with the shared raw-retention/parse/dedupe rules.
+  const existingReports = getReportCount();
+
+  // Acknowledge immediately, then run the scan as a detached job with a live
+  // status message — a large scan can outlive the 15-minute interaction
+  // window, so the job must not be tied to it (and its failure must never
+  // take the gateway down).
+  await interaction
+    .editReply({
+      content:
+        `⏳ **Backfill started** — scanning <#${channel.id}> (limit ${limit}). ` +
+        `Progress will appear in <#${interaction.channelId}>.`,
+    })
+    .catch(() => {});
+
+  void runBackfillJob(interaction, channel as TextChannel, limit, existingReports).catch(
+    (err) =>
+      console.error(
+        `[backfill] guild=${interaction.guildId} job failed:`,
+        err?.message ?? err,
+      ),
+  );
+}
+
+/**
+ * Background backfill job: streams the channel page by page, imports every
+ * message with the shared raw-retention/parse/dedupe rules, posts throttled
+ * progress, and finishes with a compact final summary. Never rejects.
+ */
+async function runBackfillJob(
+  interaction: ChatInputCommandInteraction,
+  channel: TextChannel,
+  limit: number,
+  existingReports: number,
+): Promise<void> {
+  const guildId = interaction.guildId!;
+  const startedAt = Date.now();
+  const statusSender =
+    interaction.channel && "send" in interaction.channel
+      ? (interaction.channel as unknown as {
+          send: (o: { content: string }) => Promise<Message>;
+        })
+      : null;
+  let statusMessage: Message | null = statusSender
+    ? await statusSender.send({ content: "⏳ Backfill starting…" }).catch(() => null)
+    : null;
+  const updateStatus = async (text: string): Promise<void> => {
+    const clipped = text.slice(0, MAX_REPLY_CHARS);
+    if (statusMessage) {
+      await statusMessage.edit({ content: clipped }).catch(() => {});
+    } else {
+      await interaction.editReply({ content: clipped }).catch(() => {});
+    }
+  };
+
   const counters = newImportCounters();
-  for (const [, message] of messages) {
-    await importMessage(message, counters, 50);
+  let lastStatusAt = 0;
+  try {
+    await walkHistoryPages(channel, limit, async (page) => {
+      for (const [, message] of page) await importMessage(message, counters, 50);
+      if (Date.now() - lastStatusAt > 15_000) {
+        lastStatusAt = Date.now();
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        await updateStatus(
+          `⏳ **Backfill in progress** (${elapsed}s) — <#${channel.id}>: ` +
+            `fetched ${counters.fetched}, new ${counters.imported}, dups ${counters.duplicates}, err ${counters.errors}…`,
+        );
+      }
+    });
+  } catch (err) {
+    console.error(
+      `[backfill] guild=${interaction.guildId} channel=${channel.id} fetch failed:`,
+      err,
+    );
+    await updateStatus(
+      `❌ **Backfill failed** — could not read message history in <#${channel.id}> (check LittleBot's **Read Message History** permission there).`,
+    );
+    return;
+  } finally {
+    activeScanJobs.delete(guildId);
   }
 
   console.log(
@@ -573,6 +693,7 @@ export async function handleBackfill(
     `**Raw retained:** ${counters.rawRetained}`,
     `**Parsed / imported:** ${counters.parsedReports} / ${counters.imported}`,
     `**Unsupported:** ${counters.unsupported} · **Duplicates:** ${counters.duplicates} · **Bot messages:** ${counters.botMessages} · **Errors:** ${counters.errors}`,
+    `**Reports in database before scan:** ${existingReports}. **New reports imported:** ${counters.imported}.`,
   ];
 
   if (counters.imported > 50) {
@@ -582,13 +703,20 @@ export async function handleBackfill(
     );
   }
 
-  await interaction.editReply({ content: lines.join("\n") });
+  const summary = lines.join("\n").slice(0, MAX_REPLY_CHARS);
+  await updateStatus(summary);
+  // Refresh the invoker's ephemeral reply too (silently ignored once the
+  // interaction window expires — the status message carries the result).
+  await interaction.editReply({ content: summary }).catch(() => {});
+  console.log(
+    `[backfill] guild=${interaction.guildId} channel=${channel.id} job complete in ${Math.round((Date.now() - startedAt) / 1000)}s`,
+  );
 }
 
 export async function handleUpdateReports(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
-  // Defer immediately to buy time for the scans (same pattern as /backfill).
+  // Defer immediately to acknowledge the command.
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   // ── Permission check (same as /backfill) ──
@@ -614,8 +742,9 @@ export async function handleUpdateReports(
   // ── Discover all configured report channels ──
   const channelIds = getReportChannels(interaction.guildId);
   const existingReports = getReportCount();
+  const scope = limit === undefined ? "full_history" : `bounded_per_channel_${limit}`;
   console.log(
-    `[update-reports] guild=${interaction.guildId} configuredChannels=${channelIds.length} scan=${limit === undefined ? "full_history" : `bounded_per_channel_${limit}`}`, 
+    `[update-reports] guild=${interaction.guildId} configuredChannels=${channelIds.length} scan=${scope}`,
   );
 
   if (channelIds.length === 0) {
@@ -629,102 +758,188 @@ export async function handleUpdateReports(
     return;
   }
 
+  // ── Scan concurrency guard (shared with /backfill) ──
+  if (activeScanJobs.get(interaction.guildId)) {
+    await interaction.editReply({
+      content:
+        "⏳ A report scan is already running in this server. Watch the channel for progress, then try again once it finishes.",
+    });
+    return;
+  }
+  activeScanJobs.set(interaction.guildId, true);
+
+  // Acknowledge immediately, then run the scan as a detached job with a live
+  // status message. A full-history scan of large channels takes far longer
+  // than the 15-minute interaction window, so the job is deliberately not
+  // tied to the interaction — and its failures must never take the gateway
+  // down.
+  await interaction
+    .editReply({
+      content:
+        `⏳ **Report update started** — scanning ${channelIds.length} channel(s) ` +
+        `(${limit === undefined ? "full history" : `bounded to ${limit} per channel`}). ` +
+        `Progress and a final summary will appear in <#${interaction.channelId}>.`,
+    })
+    .catch(() => {});
+
+  void runUpdateReportsJob(interaction, channelIds, limit, existingReports).catch(
+    (err) =>
+      console.error(
+        `[update-reports] guild=${interaction.guildId} job failed:`,
+        err?.message ?? err,
+      ),
+  );
+}
+
+/**
+ * Background update-reports job: streams every configured channel page by
+ * page (bounded memory), isolates per-channel/per-page failures so one bad
+ * channel cannot abort the rest, paces fetches/reactions to stay inside
+ * Discord rate limits, posts throttled progress, and finishes with a compact
+ * ≤2000-char final summary. Never rejects.
+ */
+async function runUpdateReportsJob(
+  interaction: ChatInputCommandInteraction,
+  channelIds: string[],
+  limit: number | undefined,
+  existingReports: number,
+): Promise<void> {
+  const guildId = interaction.guildId!;
+  const startedAt = Date.now();
+  const statusSender =
+    interaction.channel && "send" in interaction.channel
+      ? (interaction.channel as unknown as {
+          send: (o: { content: string }) => Promise<Message>;
+        })
+      : null;
+  let statusMessage: Message | null = statusSender
+    ? await statusSender.send({ content: "⏳ Report scan starting…" }).catch(() => null)
+    : null;
+  const updateStatus = async (text: string): Promise<void> => {
+    const clipped = text.slice(0, MAX_REPLY_CHARS);
+    if (statusMessage) {
+      await statusMessage.edit({ content: clipped }).catch(() => {});
+    } else {
+      await interaction.editReply({ content: clipped }).catch(() => {});
+    }
+  };
+
   const perChannelLines: string[] = [];
+  const totals = newImportCounters();
   let channelsOk = 0;
   let channelsFailed = 0;
-  const totals = newImportCounters();
-  let anyImportedOver50 = false;
+  let lastStatusAt = 0;
 
-  for (const channelId of channelIds) {
-    // Resolve the channel (may be null if deleted or the bot lost access).
-    let channel: Channel | null = null;
-    try {
-      channel = await interaction.client.channels.fetch(channelId);
-    } catch {
-      channel = null;
-    }
+  try {
+    for (const channelId of channelIds) {
+      // Resolve the channel (may be null if deleted or the bot lost access).
+      let channel: Channel | null = null;
+      try {
+        channel = await interaction.client.channels.fetch(channelId);
+      } catch {
+        channel = null;
+      }
 
-    // Must be a text-based channel
-    if (!channel || !("messages" in channel)) {
-      channelsFailed++;
-      perChannelLines.push(
-        `❌ <#${channelId}> — not available (deleted, or the bot lost access to it)`,
-      );
+      // Must be a text-based channel
+      if (!channel || !("messages" in channel)) {
+        channelsFailed++;
+        perChannelLines.push(
+          `❌ <#${channelId}> — not available (deleted, or the bot lost access to it)`,
+        );
+        console.log(
+          `[update-reports] guild=${guildId} channel=${channelId} failed=channel_unavailable`,
+        );
+        continue;
+      }
+
+      const textChannel = channel as TextChannel;
+      const botPerms = textChannel.permissionsFor?.(interaction.client.user?.id);
+      const permFlags = {
+        viewChannel: !!botPerms?.has(PermissionFlagsBits.ViewChannel),
+        readMessageHistory: !!botPerms?.has(
+          PermissionFlagsBits.ReadMessageHistory,
+        ),
+        addReactions: !!botPerms?.has(PermissionFlagsBits.AddReactions),
+      };
       console.log(
-        `[update-reports] guild=${interaction.guildId} channel=${channelId} failed=channel_unavailable`,
+        `[update-reports] guild=${guildId} channel=${channel.id} ` +
+          `name="${textChannel.name}" type=${textChannel.type} limit=${limit} ` +
+          `perms=${JSON.stringify(permFlags)}`,
       );
-      continue;
-    }
 
-    const textChannel = channel as TextChannel;
-    const botPerms = textChannel.permissionsFor?.(interaction.client.user?.id);
-    const permFlags = {
-      viewChannel: !!botPerms?.has(PermissionFlagsBits.ViewChannel),
-      readMessageHistory: !!botPerms?.has(
-        PermissionFlagsBits.ReadMessageHistory,
-      ),
-      addReactions: !!botPerms?.has(PermissionFlagsBits.AddReactions),
-    };
-    console.log(
-      `[update-reports] guild=${interaction.guildId} channel=${channel.id} ` +
-        `name="${textChannel.name}" type=${textChannel.type} limit=${limit} ` +
-        `perms=${JSON.stringify(permFlags)}`,
-    );
+      // ── Stream the channel one page at a time (bounded memory) ──
+      const counters = newImportCounters();
+      let fetchFailed = false;
+      try {
+        await walkHistoryPages(textChannel, limit, async (page) => {
+          for (const [, message] of page) await importMessage(message, counters, 50);
+          if (Date.now() - lastStatusAt > 15_000) {
+            lastStatusAt = Date.now();
+            const elapsed = Math.round((Date.now() - startedAt) / 1000);
+            await updateStatus(
+              `⏳ **Report scan in progress** (${elapsed}s) — channels done: ${channelsOk}/${channelIds.length}; ` +
+                `<#${channel.id}> fetched ${counters.fetched}, new ${counters.imported}…`,
+            );
+          }
+        });
+      } catch (err) {
+        fetchFailed = true;
+        console.error(
+          `[update-reports] guild=${guildId} channel=${channel.id} fetch failed:`,
+          err,
+        );
+      }
 
-    // ── Fetch messages (same safe pagination as /backfill) ──
-    let messages: Map<string, Message>;
-    try {
-      messages = await fetchChannelHistory(textChannel, limit);
-    } catch (err) {
-      console.error(
-        `[update-reports] guild=${interaction.guildId} channel=${channel.id} fetch failed:`,
-        err,
+      // Isolated per-channel failure: other channels still update.
+      if (fetchFailed) {
+        channelsFailed++;
+        perChannelLines.push(
+          `❌ <#${channel.id}> — could not read message history (check LittleBot's **Read Message History** permission there)`,
+        );
+        continue;
+      }
+      console.log(
+        `[update-reports] guild=${guildId} channel=${channel.id} fetched=${counters.fetched} messages`,
       );
-      channelsFailed++;
+
+      for (const key of ["fetched", "scanned", "imported", "rawRetained", "parsedReports", "unsupported", "duplicates", "botMessages", "errors", "logoutEvents", "zeroEarningsReports", "eventOnlyZero"] as const) totals[key] += counters[key];
+      channelsOk++;
       perChannelLines.push(
-        `❌ <#${channel.id}> — could not read message history (check LittleBot's **Read Message History** permission there)`,
+        channelResultLine(
+          true,
+          channel.id,
+          limit === undefined ? "full history" : `bounded to ${limit}`,
+          counters,
+        ),
       );
-      continue;
-    }
-    console.log(
-      `[update-reports] guild=${interaction.guildId} channel=${channel.id} fetched=${messages.size} messages`,
-    );
 
-    // ── Import with the same raw-retention/parse/dedupe rules as /backfill ──
-    const counters = newImportCounters();
-    for (const [, message] of messages) {
-      await importMessage(message, counters, 50);
+      console.log(
+        `[update-reports] guild=${guildId} channel=${channel.id} ${counterSummary(counters)}`,
+      );
     }
 
-    for (const key of ["fetched", "scanned", "imported", "rawRetained", "parsedReports", "unsupported", "duplicates", "botMessages", "errors", "logoutEvents", "zeroEarningsReports", "eventOnlyZero"] as const) totals[key] += counters[key];
-    channelsOk++;
-    if (counters.imported > 50) anyImportedOver50 = true;
-
+    const summary = buildScanSummary({
+      title: "📊 **Report Update Complete**",
+      perChannel: perChannelLines,
+      channelsOk,
+      channelsFailed,
+      totals,
+      existingReports,
+      note:
+        totals.imported > 50
+          ? "_✅ reactions were only applied to the first 50 imported messages per channel to avoid rate limits._"
+          : undefined,
+    });
+    await updateStatus(summary);
+    // Refresh the invoker's ephemeral reply too (silently ignored once the
+    // interaction window expires — the status message carries the result).
+    await interaction.editReply({ content: summary }).catch(() => {});
     console.log(
-      `[update-reports] guild=${interaction.guildId} channel=${channel.id} ${counterSummary(counters)}`,
+      `[update-reports] guild=${guildId} job complete in ${Math.round((Date.now() - startedAt) / 1000)}s — ${counterSummary(totals)} (${channelsOk} ok, ${channelsFailed} failed)`,
     );
-
-    perChannelLines.push(
-      `✅ <#${channel.id}> — ${limit === undefined ? "full history" : `bounded to ${limit} per channel`}; fetched/scanned ${counters.fetched}/${counters.scanned}, raw retained ${counters.rawRetained}, newly imported ${counters.imported}, logout events ${counters.logoutEvents} (zero reports ${counters.eventOnlyZero}), unsupported ${counters.unsupported}, existing duplicates ${counters.duplicates}, bots ${counters.botMessages}, errors ${counters.errors}`, 
-    );
+  } finally {
+    activeScanJobs.delete(guildId);
   }
-
-  const lines = [
-    "📊 **Report Update Complete**",
-    "",
-    ...perChannelLines,
-    "",
-    `**Totals (${channelsOk} updated, ${channelsFailed} failed):** ${counterSummary(totals)}`,
-    `**Reports in database before scan:** ${existingReports}. **New reports imported:** ${totals.imported}.`,
-  ];
-  if (anyImportedOver50) {
-    lines.push(
-      "",
-      `_✅ reactions were only applied to the first 50 imported messages per channel to avoid rate limits._`,
-    );
-  }
-
-  await interaction.editReply({ content: lines.join("\n") });
 }
 
 // ── Command Router ──

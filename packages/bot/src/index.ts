@@ -62,6 +62,22 @@ client.on(Events.Error, (err) => {
   console.error(`[discord.js] error: ${err?.message ?? err}`);
 });
 
+// ── Process-level guards ──
+// A single failed message/job/DB write must never take the gateway down. Log
+// aggregate details only — never message content.
+process.on("unhandledRejection", (reason) => {
+  console.error(
+    "[process] unhandled promise rejection (gateway kept alive):",
+    reason instanceof Error ? `${reason.name}: ${reason.message}` : reason,
+  );
+});
+process.on("uncaughtException", (err) => {
+  console.error(
+    "[process] uncaught exception (gateway kept alive):",
+    `${err?.name ?? "Error"}: ${err?.message ?? err}`,
+  );
+});
+
 // ── Ready ──
 
 client.once(Events.ClientReady, async (readyClient) => {
@@ -103,6 +119,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // ── Message Listener (Logout Report Detection) ──
 
 client.on(Events.MessageCreate, async (message: Message) => {
+  // Any failure while handling a live message must be contained — an
+  // unhandled rejection here would take the whole gateway down.
+  try {
   // Ignore bot messages and DMs
   if (message.author.bot || !message.guildId) return;
 
@@ -226,6 +245,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
       `⚠️ Unparseable report-shaped message from ${message.author.tag} (no message content logged)`,
     );
     await message.react("❌").catch(() => {});
+  }
+  } catch (err) {
+    console.error(
+      "Error processing message (contained, gateway stays up):",
+      err instanceof Error ? err.message : err,
+    );
   }
 });
 
