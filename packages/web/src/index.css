@@ -661,3 +661,8 @@ body {
     font-size: 0.75rem;
   }
 }
+.card-heading { display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; flex-wrap:wrap; }
+.card-heading input { border:1px solid #d1d5db; border-radius:6px; padding:.55rem .7rem; min-width:220px; }
+.muted { color:#6b7280; font-size:.85rem; margin:.25rem 0 0; }
+.table-scroll { overflow-x:auto; }
+.data-table small { color:#6b7280; font-family:monospace; }

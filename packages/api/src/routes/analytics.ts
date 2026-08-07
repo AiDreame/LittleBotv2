@@ -22,6 +22,35 @@ analyticsRouter.get("/summary", (_req, res) => {
   res.json({ summary: sales, events, daily, monthly, by_chatter: byChatter, incomplete_shifts: incomplete });
 });
 
+// Per-chatter owner view. This intentionally returns aggregates only: message content and
+// source payloads stay private in raw_messages.
+analyticsRouter.get("/chatters", (_req, res) => {
+  const db = getDb();
+  const chatters = db.prepare(`
+    SELECT c.id, c.discord_id, c.name,
+      COUNT(DISTINCT r.id) reports,
+      COALESCE(SUM(r.reported_sales), 0) sales,
+      COALESCE(SUM(r.reported_tips), 0) tips,
+      AVG(r.reported_sales) average_sale,
+      COALESCE(SUM((julianday(r.shift_end)-julianday(r.shift_start))*24), 0) shift_hours,
+      (SELECT COUNT(*) FROM chatter_events e WHERE e.chatter_id=c.id AND e.event_type='login') login_events,
+      (SELECT COUNT(*) FROM chatter_events e WHERE e.chatter_id=c.id AND e.event_type='logout') logout_events,
+      (SELECT COUNT(*) FROM chatter_events e WHERE e.chatter_id=c.id AND e.event_type='login'
+        AND NOT EXISTS (SELECT 1 FROM chatter_events x WHERE x.chatter_id=e.chatter_id AND x.event_type='logout' AND x.occurred_at>e.occurred_at)) incomplete_shifts
+    FROM chatters c LEFT JOIN reports r ON r.chatter_id=c.id
+    GROUP BY c.id ORDER BY sales DESC, c.name ASC
+  `).all();
+  const daily = db.prepare(`SELECT c.discord_id, date(r.shift_start) date, COUNT(*) reports,
+      SUM(r.reported_sales) sales, SUM(r.reported_tips) tips
+    FROM reports r JOIN chatters c ON c.id=r.chatter_id
+    GROUP BY c.id, date(r.shift_start) ORDER BY date DESC`).all();
+  const monthly = db.prepare(`SELECT c.discord_id, strftime('%Y-%m', r.shift_start) month, COUNT(*) reports,
+      SUM(r.reported_sales) sales, SUM(r.reported_tips) tips
+    FROM reports r JOIN chatters c ON c.id=r.chatter_id
+    GROUP BY c.id, month ORDER BY month DESC`).all();
+  res.json({ chatters, daily, monthly });
+});
+
 analyticsRouter.get("/raw-status", (_req, res) => {
   const db = getDb();
   res.json(db.prepare(`SELECT parse_status status, COALESCE(parse_reason,'') reason, COUNT(*) count FROM raw_messages GROUP BY parse_status, parse_reason ORDER BY count DESC`).all());

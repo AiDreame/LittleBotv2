@@ -1,186 +1,23 @@
 import { useState, useEffect } from "react";
 
-interface ReconciliationSummary {
-  total_reports: number;
-  total_reconciled: number;
-  total_discrepancies: number;
-  total_sales_diff: number;
-  total_tips_diff: number;
-  overreported_count: number;
-  underreported_count: number;
-  overreported_sales_total: number;
-  underreported_sales_total: number;
-}
-
-interface DiscrepancyDetail {
-  id: number;
-  chatter_name: string;
-  chatter_discord_id: string;
-  sales_diff: number;
-  tips_diff: number;
-  reported_sales: number;
-  reported_tips: number;
-  actual_sales: number;
-  actual_tips: number;
-  actual_date: string;
-  flagged_at: string;
-}
+interface ReconciliationSummary { total_reports: number; total_reconciled: number; total_discrepancies: number; total_sales_diff: number; total_tips_diff: number; overreported_count: number; underreported_count: number; overreported_sales_total: number; underreported_sales_total: number; }
+interface DiscrepancyDetail { id: number; chatter_name: string; chatter_discord_id: string; sales_diff: number; tips_diff: number; reported_sales: number; reported_tips: number; actual_sales: number; actual_tips: number; actual_date: string; flagged_at: string; }
+interface Chatter { discord_id: string; name: string; reports: number; sales: number; tips: number; average_sale: number | null; shift_hours: number; login_events: number; logout_events: number; incomplete_shifts: number; }
+interface Analytics { chatters: Chatter[]; daily: Array<{discord_id:string; date:string; reports:number; sales:number; tips:number}>; monthly: Array<{discord_id:string; month:string; reports:number; sales:number; tips:number}>; }
+const money = (n: number | null | undefined) => n == null ? "—" : `$${n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
 
 export default function Dashboard() {
-  const [summary, setSummary] = useState<ReconciliationSummary | null>(null);
-  const [recent, setRecent] = useState<DiscrepancyDetail[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    async function load() {
-      try {
-        const [sumRes, discRes] = await Promise.all([
-          fetch("/api/reconciliation/summary"),
-          fetch("/api/reconciliation/discrepancies"),
-        ]);
-
-        if (!sumRes.ok) throw new Error(`Summary: ${sumRes.status}`);
-        if (!discRes.ok) throw new Error(`Discrepancies: ${discRes.status}`);
-
-        const sumData = await sumRes.json();
-        const discData = await discRes.json();
-
-        setSummary(sumData as ReconciliationSummary);
-        // Only show last 10
-        setRecent(
-          ((discData as { data: DiscrepancyDetail[] }).data ?? []).slice(0, 10),
-        );
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load");
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    load();
-  }, []);
-
-  if (loading) {
-    return <div className="page-loading">Loading dashboard…</div>;
-  }
-
-  if (error) {
-    return <div className="page-error">Error: {error}</div>;
-  }
-
-  const s = summary!;
-
-  return (
-    <div className="page">
-      <h2 className="page-title">Dashboard</h2>
-
-      {/* ── Summary cards ── */}
-      <div className="summary-grid">
-        <div className="summary-card">
-          <div className="summary-value">{s.total_reports}</div>
-          <div className="summary-label">Total Reports</div>
-        </div>
-        <div className="summary-card highlight-warn">
-          <div className="summary-value">{s.total_discrepancies}</div>
-          <div className="summary-label">Discrepancies</div>
-        </div>
-        <div className="summary-card">
-          <div className="summary-value">
-            ${Math.abs(s.total_sales_diff).toLocaleString()}
-          </div>
-          <div className="summary-label">Total $ Off</div>
-        </div>
-        <div className="summary-card">
-          <div className="summary-value">{s.total_reconciled}</div>
-          <div className="summary-label">Reconciled</div>
-        </div>
-      </div>
-
-      {/* ── Over / Under breakdown ── */}
-      <div className="summary-grid">
-        <div className="summary-card over-bg">
-          <div className="summary-value">{s.overreported_count}</div>
-          <div className="summary-label">Overreported</div>
-          <div className="summary-sub">
-            +${s.overreported_sales_total.toLocaleString()}
-          </div>
-        </div>
-        <div className="summary-card under-bg">
-          <div className="summary-value">{s.underreported_count}</div>
-          <div className="summary-label">Underreported</div>
-          <div className="summary-sub">
-            -${s.underreported_sales_total.toLocaleString()}
-          </div>
-        </div>
-      </div>
-
-      {/* ── Recent discrepancies ── */}
-      <div className="card">
-        <h3 className="card-title">Recent Discrepancies</h3>
-        {recent.length === 0 ? (
-          <p className="empty">No discrepancies found.</p>
-        ) : (
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Chatter</th>
-                <th>Date</th>
-                <th>Reported $</th>
-                <th>Actual $</th>
-                <th>Sales Diff</th>
-                <th>Tips Diff</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {recent.map((d) => (
-                <tr key={d.id} className={rowClass(d.sales_diff)}>
-                  <td>{d.chatter_name}</td>
-                  <td>{d.actual_date}</td>
-                  <td>${d.reported_sales.toLocaleString()}</td>
-                  <td>${d.actual_sales.toLocaleString()}</td>
-                  <td>
-                    {d.sales_diff > 0 ? "+" : ""}
-                    {d.sales_diff.toLocaleString(undefined, {
-                      minimumFractionDigits: 2,
-                    })}
-                  </td>
-                  <td>
-                    {d.tips_diff > 0 ? "+" : ""}
-                    {d.tips_diff.toLocaleString(undefined, {
-                      minimumFractionDigits: 2,
-                    })}
-                  </td>
-                  <td>
-                    <span className={`status-badge ${statusBadge(d.sales_diff)}`}>
-                      {statusLabel(d.sales_diff)}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+  const [summary, setSummary] = useState<ReconciliationSummary | null>(null); const [recent, setRecent] = useState<DiscrepancyDetail[]>([]); const [analytics, setAnalytics] = useState<Analytics | null>(null); const [filter, setFilter] = useState(""); const [loading, setLoading] = useState(true); const [error, setError] = useState<string | null>(null);
+  useEffect(() => { (async () => { try { const [sumRes, discRes, analyticsRes] = await Promise.all([fetch("/api/reconciliation/summary"), fetch("/api/reconciliation/discrepancies"), fetch("/api/analytics/chatters")]); if (!sumRes.ok || !discRes.ok || !analyticsRes.ok) throw new Error("Analytics API unavailable"); setSummary(await sumRes.json()); const d = await discRes.json(); setRecent((d.data ?? []).slice(0, 10)); setAnalytics(await analyticsRes.json()); } catch (err) { setError(err instanceof Error ? err.message : "Failed to load"); } finally { setLoading(false); } })(); }, []);
+  if (loading) return <div className="page-loading">Loading dashboard…</div>; if (error) return <div className="page-error">Error: {error}</div>; const s = summary!; const rows = analytics?.chatters.filter(c => `${c.name} ${c.discord_id}`.toLowerCase().includes(filter.toLowerCase())) ?? [];
+  return <div className="page"><h2 className="page-title">Dashboard</h2>
+    <div className="summary-grid"><div className="summary-card"><div className="summary-value">{s.total_reports}</div><div className="summary-label">Total Reports</div></div><div className="summary-card highlight-warn"><div className="summary-value">{s.total_discrepancies}</div><div className="summary-label">Discrepancies</div></div><div className="summary-card"><div className="summary-value">{money(Math.abs(s.total_sales_diff))}</div><div className="summary-label">Total $ Off</div></div><div className="summary-card"><div className="summary-value">{s.total_reconciled}</div><div className="summary-label">Reconciled</div></div></div>
+    <div className="summary-grid"><div className="summary-card over-bg"><div className="summary-value">{s.overreported_count}</div><div className="summary-label">Overreported</div><div className="summary-sub">+{money(s.overreported_sales_total)}</div></div><div className="summary-card under-bg"><div className="summary-value">{s.underreported_count}</div><div className="summary-label">Underreported</div><div className="summary-sub">-{money(s.underreported_sales_total)}</div></div></div>
+    <div className="card"><div className="card-heading"><div><h3 className="card-title">Chatter performance</h3><p className="muted">Parsed report and shift aggregates. Unsupported messages are retained but not parsed.</p></div><input aria-label="Filter chatters" placeholder="Filter name or Discord ID" value={filter} onChange={e => setFilter(e.target.value)} /></div>
+      {rows.length === 0 ? <p className="empty">{analytics?.chatters.length ? "No chatters match this filter." : "No parsed chatter metrics yet."}</p> : <div className="table-scroll"><table className="data-table"><thead><tr><th>Chatter / Discord ID</th><th>Reports</th><th>Sales</th><th>Tips</th><th>Avg sale</th><th>Shift hours</th><th>Login / logout</th><th>Incomplete</th></tr></thead><tbody>{rows.map(c => <tr key={c.discord_id}><td><strong>{c.name || "Unknown"}</strong><br /><small>{c.discord_id}</small></td><td>{c.reports}</td><td>{money(c.sales)}</td><td>{money(c.tips)}</td><td>{money(c.average_sale)}</td><td>{c.shift_hours == null ? "—" : c.shift_hours.toFixed(1)}</td><td>{c.login_events} / {c.logout_events}</td><td>{c.incomplete_shifts || 0}</td></tr>)}</tbody></table></div>}
     </div>
-  );
+    <div className="card"><h3 className="card-title">Daily / monthly breakdown</h3><p className="muted">Breakdowns appear when parsed reports include shift dates.</p>{analytics?.monthly.length ? <div className="table-scroll"><table className="data-table"><thead><tr><th>Chatter ID</th><th>Month</th><th>Reports</th><th>Sales</th><th>Tips</th></tr></thead><tbody>{analytics.monthly.slice(0, 24).map((m, i) => <tr key={`${m.discord_id}-${m.month}-${i}`}><td>{analytics.chatters.find(c => c.discord_id === m.discord_id)?.name ?? m.discord_id}</td><td>{m.month}</td><td>{m.reports}</td><td>{money(m.sales)}</td><td>{money(m.tips)}</td></tr>)}</tbody></table></div> : <p className="empty">No dated parsed reports yet.</p>}</div>
+    <div className="card"><h3 className="card-title">Recent discrepancies</h3>{recent.length === 0 ? <p className="empty">No discrepancies found.</p> : <div className="table-scroll"><table className="data-table"><thead><tr><th>Chatter</th><th>Date</th><th>Reported</th><th>Actual</th><th>Sales diff</th><th>Status</th></tr></thead><tbody>{recent.map(d => <tr key={d.id} className={rowClass(d.sales_diff)}><td>{d.chatter_name}</td><td>{d.actual_date}</td><td>{money(d.reported_sales)}</td><td>{money(d.actual_sales)}</td><td>{d.sales_diff > 0 ? "+" : ""}{money(d.sales_diff)}</td><td><span className={`status-badge ${statusBadge(d.sales_diff)}`}>{statusLabel(d.sales_diff)}</span></td></tr>)}</tbody></table></div>}</div>
+  </div>;
 }
-
-function rowClass(salesDiff: number): string {
-  if (salesDiff > 0) return "row-over";
-  if (salesDiff < 0) return "row-under";
-  return "row-ok";
-}
-
-function statusBadge(salesDiff: number): string {
-  if (salesDiff > 0) return "badge-over";
-  if (salesDiff < 0) return "badge-under";
-  return "badge-ok";
-}
-
-function statusLabel(salesDiff: number): string {
-  if (salesDiff > 0) return "Over";
-  if (salesDiff < 0) return "Under";
-  return "Match";
-}
+function rowClass(n:number){return n>0?"row-over":n<0?"row-under":"row-ok"} function statusBadge(n:number){return n>0?"badge-over":n<0?"badge-under":"badge-ok"} function statusLabel(n:number){return n>0?"Over":n<0?"Under":"Match"}
