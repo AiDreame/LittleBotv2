@@ -5,7 +5,7 @@ import {
   REST,
   Message,
 } from "discord.js";
-import { parseLogoutMessage, looksLikeLogoutReport } from "./parser.js";
+import { parseLogoutMessage, looksLikeLogoutReport, classifyLogoutMessage } from "./parser.js";
 import { getOrCreateChatter, insertReport, getReportChannels, recordRawMessage, recordChatterEvent } from "./db.js";
 import { routeCommand, registerCommands } from "./commands.js";
 
@@ -126,6 +126,67 @@ client.on(Events.MessageCreate, async (message: Message) => {
     return;
   }
 
+  // ── Event extraction (separate from sales-report parsing) ──
+  // Every clear !logout marker records a chatter logout event (timestamp +
+  // author) even when no supported earnings/model fields exist. A sales report
+  // is only created when an explicit supported Earnings amount is present;
+  // otherwise the raw message stays retained and explicitly classified.
+  const cls = classifyLogoutMessage(message.content, message.createdAt);
+  if (cls.kind !== "not_logout") {
+    const raw = {message_id: message.id, guild_id: message.guildId, channel_id: message.channelId,
+      author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+      message_created_at: message.createdAt.toISOString(), content: message.content};
+
+    if (cls.kind === "report") {
+      try {
+        // Get or create chatter
+        const chatter = getOrCreateChatter(
+          message.author.id,
+          message.author.displayName ?? message.author.username,
+          message.guildId,
+        );
+
+        // Save to database
+        const result = insertReport(chatter.id, cls.report, message.id);
+        recordRawMessage(raw, "parsed", null);
+        recordChatterEvent({messageId: message.id, chatterId: chatter.id, guildId: message.guildId,
+          channelId: message.channelId, type: "logout", occurredAt: message.createdAt.toISOString()});
+
+        console.log(
+          `✅ Parsed report from ${message.author.tag}: sales=$${cls.report.reported_sales}, tips=$${cls.report.reported_tips}, shift=${cls.report.shift_start}–${cls.report.shift_end} (DB #${result.id})`,
+        );
+
+        // Acknowledge with ✅ reaction
+        await message.react("✅").catch(() => {});
+      } catch (err) {
+        console.error("Error saving report:", err);
+        await message.react("❌").catch(() => {});
+      }
+      return;
+    }
+
+    // Logout marker without a supported earnings amount: the event is recorded
+    // below and the raw message stays with an explicit classification. No ❌ —
+    // the logout event itself was captured.
+    try {
+      const chatter = getOrCreateChatter(
+        message.author.id,
+        message.author.displayName ?? message.author.username,
+        message.guildId,
+      );
+      recordChatterEvent({messageId: message.id, chatterId: chatter.id, guildId: message.guildId,
+        channelId: message.channelId, type: "logout", occurredAt: message.createdAt.toISOString()});
+      recordRawMessage(raw, "unparsed", "logout_event_only_no_earnings");
+      console.log(
+        `ℹ️ Logout event recorded from ${message.author.tag} (no supported earnings amount — no report created)`,
+      );
+    } catch (err) {
+      console.error("Error recording logout event:", err);
+    }
+    return;
+  }
+
+  // ── No logout marker: standard keyword report format ──
   // Parse the message
   const parsed = parseLogoutMessage(message.content, message.createdAt);
 
@@ -160,9 +221,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
     recordRawMessage({message_id: message.id, guild_id: message.guildId, channel_id: message.channelId,
       author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
       message_created_at: message.createdAt.toISOString(), content: message.content}, "failed", "report_shape_not_supported");
-    // Message looked like a report but couldn't be parsed
+    // Message looked like a report but couldn't be parsed — never log its content.
     console.log(
-      `⚠️ Unparseable report from ${message.author.tag}: "${message.content.slice(0, 100)}"`,
+      `⚠️ Unparseable report-shaped message from ${message.author.tag} (no message content logged)`,
     );
     await message.react("❌").catch(() => {});
   }

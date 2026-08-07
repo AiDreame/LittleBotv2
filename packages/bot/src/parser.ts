@@ -36,11 +36,23 @@ const TIME_RANGE_DASH_RE =
 const SHIFT_KEYWORD_RE =
   /(?:shift|worked|hours?)[:\s]+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*[-–—to]+\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/i;
 
-// !logout format: "Earnings- 52,99" or "Earnings-  52,99"
-const EARNINGS_RE = /earnings?\s*[-:]\s*([\d,.]+)/i;
-
-// !logout format: message starts with !logout
+// !logout format: message starts with !logout (clear logout marker).
 const LOGOUT_CMD_RE = /^!logout\b/im;
+
+/**
+ * !logout earnings amount — explicit "Earnings" (optionally "Total Earnings")
+ * label with an amount attached. Observed real formats (aggregate analysis of
+ * report channels, 2026-08-07):
+ *   "Earnings- 52,99" / "Earnings: 52.99" / "Earnings 52,99"
+ *   "Earnings: € 52,99" / "Earnings - € 52,99" / "Earnings: - € 52,99"
+ *   "TOTAL EARNINGS: € 52,99" / "Total Earnings € 52,99"
+ *   "TOTAL EARNINGS:$ 52,99" / "Total Earnings:(52.99$)"
+ * Conservative: requires the explicit label and an immediately following
+ * amount (separator runs, one optional €/$ symbol, optional wrapping parens).
+ * Never guesses an amount from unlabeled lines (per-performer breakdowns).
+ */
+const EARNINGS_RE =
+  /\b(?:total\s+)?earnings?\s*(?:[-:–—]+\s*){0,2}(?:[€$]\s*)?\(?\s*([\d,.]+)\s*\)?\s*(?:[€$])?/i;
 // Conservative model extraction: only accept an explicit Model/Model name label.
 const MODEL_RE = /(?:model(?:\s+name)?|performer)\s*[:=-]\s*([^\n|,]+)/i;
 
@@ -166,6 +178,52 @@ function formatShiftDate(date: Date, time: string): string {
 }
 
 /**
+ * Outcome of classifying a message against the !logout format.
+ * Event extraction is deliberately separated from sales-report parsing:
+ * a clear !logout marker always yields a chatter logout event (timestamp +
+ * author), while a sales report is only produced when a supported earnings
+ * amount is present.
+ */
+export type LogoutClassification =
+  | { kind: "report"; report: ParsedReport }
+  | { kind: "event_only"; reason: "no_supported_earnings" }
+  | { kind: "not_logout" };
+
+/**
+ * Classify a message for the !logout format.
+ *
+ * - Every clear logout marker (message starts with !logout) becomes at least
+ *   a chatter logout event, even when no supported earnings/model fields exist.
+ * - A sales report is only returned when an explicit, supported Earnings
+ *   amount is present (see EARNINGS_RE). Unlabeled amounts (per-performer
+ *   breakdown lines like "Name - € 52,99") are never guessed as the report
+ *   earnings.
+ */
+export function classifyLogoutMessage(
+  content: string,
+  messageDate?: Date,
+): LogoutClassification {
+  if (!LOGOUT_CMD_RE.test(content)) return { kind: "not_logout" };
+
+  const earnings = extractEarnings(content);
+  if (earnings === null) {
+    return { kind: "event_only", reason: "no_supported_earnings" };
+  }
+
+  const date = messageDate ?? new Date();
+  return {
+    kind: "report",
+    report: {
+      reported_sales: earnings,
+      reported_tips: 0,
+      shift_start: formatShiftDate(date, "00:00"),
+      shift_end: formatShiftDate(date, "23:59"),
+      model_name: extractModelName(content),
+    },
+  };
+}
+
+/**
  * Parse a logout message and extract structured data.
  *
  * Supports two formats:
@@ -176,31 +234,22 @@ function formatShiftDate(date: Date, time: string): string {
  *
  *   2. !logout format (European decimals, no explicit shift):
  *      "!logout\nAdded sales from Model- 15,99\nEarnings- 52,99"
- *      Uses messageDate for shift times.
+ *      "!logout\nTotal Earnings - € 52,99"
+ *      Uses messageDate for shift times. Returns null when the message has a
+ *      logout marker but no supported earnings amount — callers that need the
+ *      event-only outcome should use {@link classifyLogoutMessage} instead.
  *
  * @param content - The raw message text
  * @param messageDate - Optional Date of the message (used for !logout shift)
- * @returns ParsedReport on success, or null if the message doesn't look like a report.
+ * @returns ParsedReport on success, or null if the message doesn't yield a report.
  */
 export function parseLogoutMessage(
   content: string,
   messageDate?: Date,
 ): ParsedReport | null {
-  // ── !logout format ──
-  const isLogoutCmd = LOGOUT_CMD_RE.test(content);
-  if (isLogoutCmd) {
-    const earnings = extractEarnings(content);
-    if (earnings === null) return null;
-
-    const date = messageDate ?? new Date();
-    return {
-      reported_sales: earnings,
-      reported_tips: 0,
-      shift_start: formatShiftDate(date, "00:00"),
-      shift_end: formatShiftDate(date, "23:59"),
-      model_name: extractModelName(content),
-    };
-  }
+  const cls = classifyLogoutMessage(content, messageDate);
+  if (cls.kind === "report") return cls.report;
+  if (cls.kind === "event_only") return null;
 
   // ── Standard keyword format ──
   const sales = extractAmount(content, "sales");
