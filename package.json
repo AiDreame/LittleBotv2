@@ -1,0 +1,15 @@
+{
+  "name": "salesrecon",
+  "private": true,
+  "description": "LittleBot — Discord bot for reconciling sales team self-reported numbers against platform data",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "dev:bot": "pnpm --filter @salesrecon/bot dev",
+    "dev:api": "pnpm --filter @salesrecon/api dev",
+    "dev:web": "pnpm --filter @salesrecon/web dev"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
