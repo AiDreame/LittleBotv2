@@ -105,31 +105,23 @@ export const commands = [
 // chatter event, and ✅ reaction (capped to avoid rate limits).
 
 type ImportCounters = {
+  fetched: number;
   scanned: number;
   imported: number;
-  skipped: number;
-  skipReasons: {
-    botMessages: number;
-    preFilter: number;
-    parseFailed: number;
-    alreadyImported: number;
-    insertError: number;
-  };
+  rawRetained: number;
+  parsedReports: number;
+  unsupported: number;
+  duplicates: number;
+  botMessages: number;
+  errors: number;
 };
 
 function newImportCounters(): ImportCounters {
-  return {
-    scanned: 0,
-    imported: 0,
-    skipped: 0,
-    skipReasons: {
-      botMessages: 0,
-      preFilter: 0,
-      parseFailed: 0,
-      alreadyImported: 0,
-      insertError: 0,
-    },
-  };
+  return { fetched: 0, scanned: 0, imported: 0, rawRetained: 0, parsedReports: 0, unsupported: 0, duplicates: 0, botMessages: 0, errors: 0 };
+}
+
+function counterSummary(c: ImportCounters): string {
+  return `fetched=${c.fetched} scanned=${c.scanned} rawRetained=${c.rawRetained} parsedReports=${c.parsedReports} unsupported=${c.unsupported} duplicates=${c.duplicates} botMessages=${c.botMessages} errors=${c.errors}`;
 }
 
 function rawInputFor(message: Message): RawMessageInput {
@@ -154,39 +146,38 @@ async function importMessage(
   counters: ImportCounters,
   maxReactions: number,
 ): Promise<void> {
+  counters.fetched++;
   counters.scanned++;
-  recordRawMessage(rawInputFor(message), "fetched", null);
+  const raw = rawInputFor(message);
+  recordRawMessage(raw, "unparsed", "fetched");
+  counters.rawRetained++;
 
-  // Skip bot messages
+  // Bot messages are retained but never interpreted as sales.
   if (message.author.bot) {
-    recordRawMessage(rawInputFor(message), "skipped", "bot_message");
-    counters.skipped++;
-    counters.skipReasons.botMessages++;
+    recordRawMessage(raw, "unparsed", "bot_message");
+    counters.botMessages++;
     return;
   }
 
-  // Quick pre-filter
+  // Quick pre-filter. Keep the source row even when unsupported.
   if (!looksLikeLogoutReport(message.content)) {
-    recordRawMessage(rawInputFor(message), "skipped", "does_not_look_like_report");
-    counters.skipped++;
-    counters.skipReasons.preFilter++;
+    recordRawMessage(raw, "unparsed", "unsupported_format");
+    counters.unsupported++;
     return;
   }
 
-  // Parse
   const parsed = parseLogoutMessage(message.content, message.createdAt);
   if (!parsed) {
-    recordRawMessage(rawInputFor(message), "failed", "report_shape_not_supported");
-    counters.skipped++;
-    counters.skipReasons.parseFailed++;
+    recordRawMessage(raw, "unparsed", "unsupported_report_shape");
+    counters.unsupported++;
     return;
   }
 
   // Check for duplicate
   const existing = getReportByMessageId(message.id);
   if (existing) {
-    counters.skipped++;
-    counters.skipReasons.alreadyImported++;
+    recordRawMessage(raw, "parsed", "duplicate_report");
+    counters.duplicates++;
     return;
   }
 
@@ -198,7 +189,8 @@ async function importMessage(
       message.guildId ?? "",
     );
     insertReport(chatter.id, parsed, message.id);
-    recordRawMessage(rawInputFor(message), "parsed", null);
+    recordRawMessage(raw, "parsed", "imported");
+    counters.parsedReports++;
     recordChatterEvent({messageId: message.id, chatterId: chatter.id, guildId: message.guildId ?? "",
       channelId: message.channelId, type: "logout", occurredAt: message.createdAt.toISOString()});
     counters.imported++;
@@ -212,8 +204,8 @@ async function importMessage(
       `Error importing message ${message.id}:`,
       err,
     );
-    counters.skipped++;
-    counters.skipReasons.insertError++;
+    recordRawMessage(raw, "unparsed", "import_error");
+    counters.errors++;
   }
 }
 
@@ -494,18 +486,17 @@ export async function handleBackfill(
   }
 
   console.log(
-    `[backfill] guild=${interaction.guildId} channel=${channel.id} ` +
-      `scanned=${counters.scanned} imported=${counters.imported} skipped=${counters.skipped} ` +
-      `byReason=${JSON.stringify(counters.skipReasons)}`,
+    `[backfill] guild=${interaction.guildId} channel=${channel.id} ${counterSummary(counters)}`,
   );
 
   const lines = [
     "📊 **Backfill Complete**",
     "",
     `**Channel:** <#${channel.id}>`,
-    `**Scanned:** ${counters.scanned} messages`,
-    `**Imported:** ${counters.imported} reports`,
-    `**Skipped:** ${counters.skipped} messages`,
+    `**Fetched / scanned:** ${counters.fetched} / ${counters.scanned}`,
+    `**Raw retained:** ${counters.rawRetained}`,
+    `**Parsed / imported:** ${counters.parsedReports} / ${counters.imported}`,
+    `**Unsupported:** ${counters.unsupported} · **Duplicates:** ${counters.duplicates} · **Bot messages:** ${counters.botMessages} · **Errors:** ${counters.errors}`,
   ];
 
   if (counters.imported > 50) {
@@ -565,7 +556,7 @@ export async function handleUpdateReports(
   const perChannelLines: string[] = [];
   let channelsOk = 0;
   let channelsFailed = 0;
-  const totals = { scanned: 0, imported: 0, skipped: 0 };
+  const totals = newImportCounters();
   let anyImportedOver50 = false;
 
   for (const channelId of channelIds) {
@@ -629,20 +620,16 @@ export async function handleUpdateReports(
       await importMessage(message, counters, 50);
     }
 
-    totals.scanned += counters.scanned;
-    totals.imported += counters.imported;
-    totals.skipped += counters.skipped;
+    for (const key of ["fetched", "scanned", "imported", "rawRetained", "parsedReports", "unsupported", "duplicates", "botMessages", "errors"] as const) totals[key] += counters[key];
     channelsOk++;
     if (counters.imported > 50) anyImportedOver50 = true;
 
     console.log(
-      `[update-reports] guild=${interaction.guildId} channel=${channel.id} ` +
-        `scanned=${counters.scanned} imported=${counters.imported} skipped=${counters.skipped} ` +
-        `byReason=${JSON.stringify(counters.skipReasons)}`,
+      `[update-reports] guild=${interaction.guildId} channel=${channel.id} ${counterSummary(counters)}`,
     );
 
     perChannelLines.push(
-      `✅ <#${channel.id}> — scanned ${counters.scanned}, imported ${counters.imported}, skipped ${counters.skipped}`,
+      `✅ <#${channel.id}> — fetched/scanned ${counters.fetched}/${counters.scanned}, raw ${counters.rawRetained}, parsed/imported ${counters.parsedReports}/${counters.imported}, unsupported ${counters.unsupported}, duplicates ${counters.duplicates}, bots ${counters.botMessages}, errors ${counters.errors}`,
     );
   }
 
@@ -651,8 +638,7 @@ export async function handleUpdateReports(
     "",
     ...perChannelLines,
     "",
-    `**Totals:** ${channelsOk} channel(s) updated, ${channelsFailed} failed — ` +
-      `scanned ${totals.scanned}, imported ${totals.imported}, skipped ${totals.skipped}`,
+    `**Totals (${channelsOk} updated, ${channelsFailed} failed):** ${counterSummary(totals)}`,
   ];
   if (anyImportedOver50) {
     lines.push(
