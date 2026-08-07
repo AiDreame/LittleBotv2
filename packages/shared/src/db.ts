@@ -126,6 +126,8 @@ function runMigrations(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_chatters_team ON chatters(team_id);
     CREATE INDEX IF NOT EXISTS idx_reports_chatter ON reports(chatter_id);
     CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+    -- Discord message IDs are stable source keys; enforce import idempotency.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_message_id ON reports(message_id);
     CREATE INDEX IF NOT EXISTS idx_actuals_chatter ON actuals(chatter_id);
     CREATE INDEX IF NOT EXISTS idx_actuals_date ON actuals(date);
     CREATE INDEX IF NOT EXISTS idx_discrepancies_report ON discrepancies(report_id);

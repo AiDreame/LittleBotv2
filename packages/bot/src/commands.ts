@@ -1,4 +1,4 @@
-import type { ChatInputCommandInteraction, TextChannel } from "discord.js";
+import type { ChatInputCommandInteraction, Message, TextChannel } from "discord.js";
 import { REST, Routes, SlashCommandBuilder as Builder, PermissionFlagsBits, MessageFlags } from "discord.js";
 import { parseLogoutMessage, looksLikeLogoutReport } from "./parser.js";
 import {
@@ -72,9 +72,9 @@ export const commands = [
     .addIntegerOption((opt) =>
       opt
         .setName("limit")
-        .setDescription("Maximum number of messages to scan (default 100, max 500)")
+        .setDescription("Maximum number of messages to scan (default 100, max 5000)")
         .setMinValue(1)
-        .setMaxValue(500)
+        .setMaxValue(5000)
         .setRequired(false),
     ),
 ];
@@ -260,12 +260,24 @@ export async function handleBackfill(
   }
 
   // ── Fetch messages ──
+  // Discord's history endpoint returns at most 100 messages per request. A
+  // single fetch({ limit }) therefore silently stops at the API page size;
+  // walk backwards with `before` until the requested scan limit is reached.
   const textChannel = channel as TextChannel;
-  let messages;
+  const messages = new Map<string, Message>();
   try {
-    messages = await textChannel.messages.fetch({
-      limit: Math.min(limit, 500),
-    });
+    let before: string | undefined;
+    while (messages.size < limit) {
+      const page = await textChannel.messages.fetch({
+        limit: Math.min(100, limit - messages.size),
+        ...(before ? { before } : {}),
+      });
+      if (page.size === 0) break;
+      for (const [id, message] of page) messages.set(id, message);
+      const oldest = page.last();
+      if (!oldest || page.size < Math.min(100, limit - (messages.size - page.size))) break;
+      before = oldest.id;
+    }
   } catch (err) {
     console.error("Backfill message fetch failed:", err);
     await interaction.editReply({
