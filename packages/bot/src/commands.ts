@@ -8,6 +8,8 @@ import {
   getOrCreateChatter,
   insertReport,
   getReportByMessageId,
+  recordRawMessage,
+  recordChatterEvent,
 } from "./db.js";
 
 // ── Command Definitions ──
@@ -356,8 +358,16 @@ export async function handleBackfill(
   for (const [, message] of messages) {
     scanned++;
 
+    // Raw source retention happens before all filters; content is stored only in the private DB.
+    recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
+      author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+      message_created_at: message.createdAt.toISOString(), content: message.content}, "fetched", null);
+
     // Skip bot messages
     if (message.author.bot) {
+      recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
+        author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+        message_created_at: message.createdAt.toISOString(), content: message.content}, "skipped", "bot_message");
       skipped++;
       skipReasons.botMessages++;
       continue;
@@ -365,6 +375,9 @@ export async function handleBackfill(
 
     // Quick pre-filter
     if (!looksLikeLogoutReport(message.content)) {
+      recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
+        author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+        message_created_at: message.createdAt.toISOString(), content: message.content}, "skipped", "does_not_look_like_report");
       skipped++;
       skipReasons.preFilter++;
       continue;
@@ -373,6 +386,9 @@ export async function handleBackfill(
     // Parse
     const parsed = parseLogoutMessage(message.content, message.createdAt);
     if (!parsed) {
+      recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
+        author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+        message_created_at: message.createdAt.toISOString(), content: message.content}, "failed", "report_shape_not_supported");
       skipped++;
       skipReasons.parseFailed++;
       continue;
@@ -394,6 +410,11 @@ export async function handleBackfill(
         interaction.guildId,
       );
       insertReport(chatter.id, parsed, message.id);
+      recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
+        author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+        message_created_at: message.createdAt.toISOString(), content: message.content}, "parsed", null);
+      recordChatterEvent({messageId: message.id, chatterId: chatter.id, guildId: interaction.guildId,
+        channelId: message.channelId, type: "logout", occurredAt: message.createdAt.toISOString()});
       imported++;
 
       // React with ✅ on the imported message (cap at 50 to avoid rate limits)

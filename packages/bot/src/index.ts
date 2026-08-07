@@ -6,7 +6,7 @@ import {
   Message,
 } from "discord.js";
 import { parseLogoutMessage, looksLikeLogoutReport } from "./parser.js";
-import { getOrCreateChatter, insertReport, getReportChannels } from "./db.js";
+import { getOrCreateChatter, insertReport, getReportChannels, recordRawMessage, recordChatterEvent } from "./db.js";
 import { routeCommand, registerCommands } from "./commands.js";
 
 // ── Client Setup ──
@@ -113,8 +113,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
   // Only process messages in one of the configured report channels
   if (!reportChannels.includes(message.channelId)) return;
 
+  // Retain every watched-channel message privately before parsing.
+  recordRawMessage({message_id: message.id, guild_id: message.guildId, channel_id: message.channelId,
+    author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+    message_created_at: message.createdAt.toISOString(), content: message.content}, "fetched", null);
+
   // Quick pre-filter: does this look like a logout report?
-  if (!looksLikeLogoutReport(message.content)) return;
+  if (!looksLikeLogoutReport(message.content)) {
+    recordRawMessage({message_id: message.id, guild_id: message.guildId, channel_id: message.channelId,
+      author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+      message_created_at: message.createdAt.toISOString(), content: message.content}, "skipped", "does_not_look_like_report");
+    return;
+  }
 
   // Parse the message
   const parsed = parseLogoutMessage(message.content, message.createdAt);
@@ -130,6 +140,11 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
       // Save to database
       const result = insertReport(chatter.id, parsed, message.id);
+      recordRawMessage({message_id: message.id, guild_id: message.guildId, channel_id: message.channelId,
+        author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+        message_created_at: message.createdAt.toISOString(), content: message.content}, "parsed", null);
+      recordChatterEvent({messageId: message.id, chatterId: chatter.id, guildId: message.guildId,
+        channelId: message.channelId, type: "logout", occurredAt: message.createdAt.toISOString()});
 
       console.log(
         `✅ Parsed report from ${message.author.tag}: sales=$${parsed.reported_sales}, tips=$${parsed.reported_tips}, shift=${parsed.shift_start}–${parsed.shift_end} (DB #${result.id})`,
@@ -142,6 +157,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
       await message.react("❌").catch(() => {});
     }
   } else {
+    recordRawMessage({message_id: message.id, guild_id: message.guildId, channel_id: message.channelId,
+      author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
+      message_created_at: message.createdAt.toISOString(), content: message.content}, "failed", "report_shape_not_supported");
     // Message looked like a report but couldn't be parsed
     console.log(
       `⚠️ Unparseable report from ${message.author.tag}: "${message.content.slice(0, 100)}"`,

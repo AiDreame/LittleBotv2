@@ -5,6 +5,26 @@ import type { ParsedReport, GuildConfig, ReportWriteResult } from "@salesrecon/t
 // Re-export for convenience
 export { getDb, closeDb } from "@salesrecon/shared";
 
+export type RawMessageInput = {
+  message_id: string; guild_id: string; channel_id: string; author_id: string;
+  author_name: string; message_created_at: string; content: string;
+};
+
+/** Retain every fetched Discord message; updates parse state without duplicating source rows. */
+export function recordRawMessage(input: RawMessageInput, status = "unparsed", reason: string | null = null): void {
+  const db = getDb();
+  db.prepare(`INSERT INTO raw_messages
+    (message_id,guild_id,channel_id,author_id,author_name,message_created_at,content,parse_status,parse_reason)
+    VALUES (@message_id,@guild_id,@channel_id,@author_id,@author_name,@message_created_at,@content,@status,@reason)
+    ON CONFLICT(message_id) DO UPDATE SET parse_status=@status, parse_reason=@reason`).run({...input, status, reason});
+}
+
+export function recordChatterEvent(input: {messageId: string; chatterId: number; guildId: string; channelId: string; type: "login"|"logout"; occurredAt: string}): void {
+  getDb().prepare(`INSERT OR IGNORE INTO chatter_events
+    (message_id,chatter_id,guild_id,channel_id,event_type,occurred_at) VALUES (?,?,?,?,?,?)`)
+    .run(input.messageId,input.chatterId,input.guildId,input.channelId,input.type,input.occurredAt);
+}
+
 // ── Guild Config ──
 
 /**

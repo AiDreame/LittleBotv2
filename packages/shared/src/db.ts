@@ -131,5 +131,40 @@ function runMigrations(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_actuals_chatter ON actuals(chatter_id);
     CREATE INDEX IF NOT EXISTS idx_actuals_date ON actuals(date);
     CREATE INDEX IF NOT EXISTS idx_discrepancies_report ON discrepancies(report_id);
+
+    -- Raw Discord source messages are retained independently from parsed reports.
+    CREATE TABLE IF NOT EXISTS raw_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id TEXT NOT NULL UNIQUE,
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      author_id TEXT NOT NULL,
+      author_name TEXT NOT NULL,
+      message_created_at TEXT NOT NULL,
+      content TEXT NOT NULL DEFAULT '',
+      parse_status TEXT NOT NULL DEFAULT 'unparsed',
+      parse_reason TEXT,
+      imported_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_raw_messages_channel ON raw_messages(channel_id, message_created_at);
+    CREATE INDEX IF NOT EXISTS idx_raw_messages_status ON raw_messages(parse_status);
+
+    CREATE TABLE IF NOT EXISTS chatter_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id TEXT NOT NULL UNIQUE,
+      chatter_id INTEGER NOT NULL REFERENCES chatters(id) ON DELETE CASCADE,
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK (event_type IN ('login','logout')),
+      occurred_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_chatter_events_time ON chatter_events(chatter_id, occurred_at);
   `);
+  // Safe additive migrations for databases created before analytics foundation.
+  const reportColumns = database.prepare("PRAGMA table_info(reports)").all() as Array<{name: string}>;
+  if (!reportColumns.some((c) => c.name === "model_name")) {
+    database.exec("ALTER TABLE reports ADD COLUMN model_name TEXT");
+  }
+  database.exec("CREATE INDEX IF NOT EXISTS idx_reports_model ON reports(model_name)");
 }

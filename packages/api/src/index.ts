@@ -4,6 +4,7 @@ import type { HealthCheck } from "@salesrecon/types";
 import { actualsRouter } from "./routes/actuals.js";
 import { reconciliationRouter } from "./routes/reconciliation.js";
 import { reportsRouter } from "./routes/reports.js";
+import { analyticsRouter } from "./routes/analytics.js";
 
 const app: Express = express();
 const PORT = parseInt(process.env.PORT || "3001", 10);
@@ -29,6 +30,7 @@ app.use("/api/reconciliation", reconciliationRouter);
 
 // ── Reports Routes ──
 app.use("/api/reports", reportsRouter);
+app.use("/api/analytics", analyticsRouter);
 
 // ── Start ──
 app.listen(PORT, "0.0.0.0", () => {
