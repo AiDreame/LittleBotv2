@@ -1,4 +1,4 @@
-import type { ChatInputCommandInteraction, Message, TextChannel } from "discord.js";
+import type { ChatInputCommandInteraction, Message, TextChannel, Channel } from "discord.js";
 import { REST, Routes, SlashCommandBuilder as Builder, PermissionFlagsBits, MessageFlags } from "discord.js";
 import { parseLogoutMessage, looksLikeLogoutReport } from "./parser.js";
 import {
@@ -11,6 +11,7 @@ import {
   recordRawMessage,
   recordChatterEvent,
 } from "./db.js";
+import type { RawMessageInput } from "./db.js";
 
 // ── Command Definitions ──
 
@@ -83,9 +84,164 @@ export const commands = [
         .setMaxValue(5000)
         .setRequired(false),
     ),
+
+  new Builder()
+    .setName("update-reports")
+    .setDescription("Scan all configured report channels and import any new logout reports")
+    .addIntegerOption((opt) =>
+      opt
+        .setName("limit")
+        .setDescription("Maximum messages to scan per channel (default 100, max 5000)")
+        .setMinValue(1)
+        .setMaxValue(5000)
+        .setRequired(false),
+    ),
 ];
 
 // ── Command Handlers ──
+
+// Shared by /backfill and /update-reports so both scan with identical rules:
+// raw source retention, bot-message skip, pre-filter, parse, dedupe, insert,
+// chatter event, and ✅ reaction (capped to avoid rate limits).
+
+type ImportCounters = {
+  scanned: number;
+  imported: number;
+  skipped: number;
+  skipReasons: {
+    botMessages: number;
+    preFilter: number;
+    parseFailed: number;
+    alreadyImported: number;
+    insertError: number;
+  };
+};
+
+function newImportCounters(): ImportCounters {
+  return {
+    scanned: 0,
+    imported: 0,
+    skipped: 0,
+    skipReasons: {
+      botMessages: 0,
+      preFilter: 0,
+      parseFailed: 0,
+      alreadyImported: 0,
+      insertError: 0,
+    },
+  };
+}
+
+function rawInputFor(message: Message): RawMessageInput {
+  return {
+    message_id: message.id,
+    guild_id: message.guildId ?? "",
+    channel_id: message.channelId,
+    author_id: message.author.id,
+    author_name: message.author.displayName ?? message.author.username,
+    message_created_at: message.createdAt.toISOString(),
+    content: message.content,
+  };
+}
+
+/**
+ * Run one fetched message through the full import pipeline.
+ * Raw source retention happens before all filters; content is stored only in
+ * the private DB. Aggregate counters are never logged per-message.
+ */
+async function importMessage(
+  message: Message,
+  counters: ImportCounters,
+  maxReactions: number,
+): Promise<void> {
+  counters.scanned++;
+  recordRawMessage(rawInputFor(message), "fetched", null);
+
+  // Skip bot messages
+  if (message.author.bot) {
+    recordRawMessage(rawInputFor(message), "skipped", "bot_message");
+    counters.skipped++;
+    counters.skipReasons.botMessages++;
+    return;
+  }
+
+  // Quick pre-filter
+  if (!looksLikeLogoutReport(message.content)) {
+    recordRawMessage(rawInputFor(message), "skipped", "does_not_look_like_report");
+    counters.skipped++;
+    counters.skipReasons.preFilter++;
+    return;
+  }
+
+  // Parse
+  const parsed = parseLogoutMessage(message.content, message.createdAt);
+  if (!parsed) {
+    recordRawMessage(rawInputFor(message), "failed", "report_shape_not_supported");
+    counters.skipped++;
+    counters.skipReasons.parseFailed++;
+    return;
+  }
+
+  // Check for duplicate
+  const existing = getReportByMessageId(message.id);
+  if (existing) {
+    counters.skipped++;
+    counters.skipReasons.alreadyImported++;
+    return;
+  }
+
+  // Get or create chatter and insert
+  try {
+    const chatter = getOrCreateChatter(
+      message.author.id,
+      message.author.displayName ?? message.author.username,
+      message.guildId ?? "",
+    );
+    insertReport(chatter.id, parsed, message.id);
+    recordRawMessage(rawInputFor(message), "parsed", null);
+    recordChatterEvent({messageId: message.id, chatterId: chatter.id, guildId: message.guildId ?? "",
+      channelId: message.channelId, type: "logout", occurredAt: message.createdAt.toISOString()});
+    counters.imported++;
+
+    // React with ✅ on the imported message (cap to avoid rate limits)
+    if (counters.imported <= maxReactions) {
+      await message.react("✅").catch(() => {});
+    }
+  } catch (err) {
+    console.error(
+      `Error importing message ${message.id}:`,
+      err,
+    );
+    counters.skipped++;
+    counters.skipReasons.insertError++;
+  }
+}
+
+/**
+ * Fetch up to `limit` messages from a text channel.
+ * Discord's history endpoint returns at most 100 messages per request. A
+ * single fetch({ limit }) therefore silently stops at the API page size;
+ * walk backwards with `before` until the requested scan limit is reached.
+ */
+async function fetchChannelHistory(
+  channel: TextChannel,
+  limit: number,
+): Promise<Map<string, Message>> {
+  const messages = new Map<string, Message>();
+  let before: string | undefined;
+  while (messages.size < limit) {
+    const page = await channel.messages.fetch({
+      limit: Math.min(100, limit - messages.size),
+      ...(before ? { before } : {}),
+    });
+    if (page.size === 0) break;
+    for (const [id, message] of page) messages.set(id, message);
+    const oldest = page.last();
+    if (!oldest || page.size < Math.min(100, limit - (messages.size - page.size))) break;
+    before = oldest.id;
+  }
+  return messages;
+}
 
 function commandUsage(command: (typeof commands)[number]): string {
   const data = command.toJSON();
@@ -313,24 +469,12 @@ export async function handleBackfill(
   );
 
   // ── Fetch messages ──
-  // Discord's history endpoint returns at most 100 messages per request. A
-  // single fetch({ limit }) therefore silently stops at the API page size;
-  // walk backwards with `before` until the requested scan limit is reached.
+  // Paginate backwards with `before` up to the requested scan limit (the
+  // history endpoint only returns 100 messages per request).
   const textChannel = channel as TextChannel;
-  const messages = new Map<string, Message>();
+  let messages: Map<string, Message>;
   try {
-    let before: string | undefined;
-    while (messages.size < limit) {
-      const page = await textChannel.messages.fetch({
-        limit: Math.min(100, limit - messages.size),
-        ...(before ? { before } : {}),
-      });
-      if (page.size === 0) break;
-      for (const [id, message] of page) messages.set(id, message);
-      const oldest = page.last();
-      if (!oldest || page.size < Math.min(100, limit - (messages.size - page.size))) break;
-      before = oldest.id;
-    }
+    messages = await fetchChannelHistory(textChannel, limit);
   } catch (err) {
     console.error("Backfill message fetch failed:", err);
     await interaction.editReply({
@@ -343,113 +487,177 @@ export async function handleBackfill(
     `[backfill] guild=${interaction.guildId} channel=${channel.id} fetched=${messages.size} messages`,
   );
 
-  let scanned = 0;
-  let imported = 0;
-  let skipped = 0;
-  // Skip-reason breakdown (aggregate counters only — no content)
-  const skipReasons = {
-    botMessages: 0,
-    preFilter: 0,
-    parseFailed: 0,
-    alreadyImported: 0,
-    insertError: 0,
-  };
-
+  // Process each message with the shared raw-retention/parse/dedupe rules.
+  const counters = newImportCounters();
   for (const [, message] of messages) {
-    scanned++;
-
-    // Raw source retention happens before all filters; content is stored only in the private DB.
-    recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
-      author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
-      message_created_at: message.createdAt.toISOString(), content: message.content}, "fetched", null);
-
-    // Skip bot messages
-    if (message.author.bot) {
-      recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
-        author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
-        message_created_at: message.createdAt.toISOString(), content: message.content}, "skipped", "bot_message");
-      skipped++;
-      skipReasons.botMessages++;
-      continue;
-    }
-
-    // Quick pre-filter
-    if (!looksLikeLogoutReport(message.content)) {
-      recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
-        author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
-        message_created_at: message.createdAt.toISOString(), content: message.content}, "skipped", "does_not_look_like_report");
-      skipped++;
-      skipReasons.preFilter++;
-      continue;
-    }
-
-    // Parse
-    const parsed = parseLogoutMessage(message.content, message.createdAt);
-    if (!parsed) {
-      recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
-        author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
-        message_created_at: message.createdAt.toISOString(), content: message.content}, "failed", "report_shape_not_supported");
-      skipped++;
-      skipReasons.parseFailed++;
-      continue;
-    }
-
-    // Check for duplicate
-    const existing = getReportByMessageId(message.id);
-    if (existing) {
-      skipped++;
-      skipReasons.alreadyImported++;
-      continue;
-    }
-
-    // Get or create chatter and insert
-    try {
-      const chatter = getOrCreateChatter(
-        message.author.id,
-        message.author.displayName ?? message.author.username,
-        interaction.guildId,
-      );
-      insertReport(chatter.id, parsed, message.id);
-      recordRawMessage({message_id: message.id, guild_id: interaction.guildId, channel_id: message.channelId,
-        author_id: message.author.id, author_name: message.author.displayName ?? message.author.username,
-        message_created_at: message.createdAt.toISOString(), content: message.content}, "parsed", null);
-      recordChatterEvent({messageId: message.id, chatterId: chatter.id, guildId: interaction.guildId,
-        channelId: message.channelId, type: "logout", occurredAt: message.createdAt.toISOString()});
-      imported++;
-
-      // React with ✅ on the imported message (cap at 50 to avoid rate limits)
-      if (imported <= 50) {
-        await message.react("✅").catch(() => {});
-      }
-    } catch (err) {
-      console.error(
-        `Error importing message ${message.id}:`,
-        err,
-      );
-      skipped++;
-      skipReasons.insertError++;
-    }
+    await importMessage(message, counters, 50);
   }
 
   console.log(
     `[backfill] guild=${interaction.guildId} channel=${channel.id} ` +
-      `scanned=${scanned} imported=${imported} skipped=${skipped} ` +
-      `byReason=${JSON.stringify(skipReasons)}`,
+      `scanned=${counters.scanned} imported=${counters.imported} skipped=${counters.skipped} ` +
+      `byReason=${JSON.stringify(counters.skipReasons)}`,
   );
 
   const lines = [
     "📊 **Backfill Complete**",
     "",
     `**Channel:** <#${channel.id}>`,
-    `**Scanned:** ${scanned} messages`,
-    `**Imported:** ${imported} reports`,
-    `**Skipped:** ${skipped} messages`,
+    `**Scanned:** ${counters.scanned} messages`,
+    `**Imported:** ${counters.imported} reports`,
+    `**Skipped:** ${counters.skipped} messages`,
   ];
 
-  if (imported > 50) {
+  if (counters.imported > 50) {
     lines.push(
       "",
       `_✅ reactions were only applied to the first 50 imported messages to avoid rate limits._`,
+    );
+  }
+
+  await interaction.editReply({ content: lines.join("\n") });
+}
+
+export async function handleUpdateReports(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  // Defer immediately to buy time for the scans (same pattern as /backfill).
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // ── Permission check (same as /backfill) ──
+  if (
+    !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
+  ) {
+    await interaction.editReply({
+      content:
+        "❌ You need the **Manage Server** permission to use this command.",
+    });
+    return;
+  }
+
+  if (!interaction.guildId) {
+    await interaction.editReply({
+      content: "❌ This command can only be used in a server.",
+    });
+    return;
+  }
+
+  const limit =
+    interaction.options.getInteger("limit", false) ?? 100;
+
+  // ── Discover all configured report channels ──
+  const channelIds = getReportChannels(interaction.guildId);
+  console.log(
+    `[update-reports] guild=${interaction.guildId} configuredChannels=${channelIds.length} limit=${limit}`,
+  );
+
+  if (channelIds.length === 0) {
+    await interaction.editReply({
+      content: [
+        "ℹ️ **No report channels configured.**",
+        "",
+        "Add one or more channels to the watch list with `/set-channel`, then run `/update-reports` again.",
+      ].join("\n"),
+    });
+    return;
+  }
+
+  const perChannelLines: string[] = [];
+  let channelsOk = 0;
+  let channelsFailed = 0;
+  const totals = { scanned: 0, imported: 0, skipped: 0 };
+  let anyImportedOver50 = false;
+
+  for (const channelId of channelIds) {
+    // Resolve the channel (may be null if deleted or the bot lost access).
+    let channel: Channel | null = null;
+    try {
+      channel = await interaction.client.channels.fetch(channelId);
+    } catch {
+      channel = null;
+    }
+
+    // Must be a text-based channel
+    if (!channel || !("messages" in channel)) {
+      channelsFailed++;
+      perChannelLines.push(
+        `❌ <#${channelId}> — not available (deleted, or the bot lost access to it)`,
+      );
+      console.log(
+        `[update-reports] guild=${interaction.guildId} channel=${channelId} failed=channel_unavailable`,
+      );
+      continue;
+    }
+
+    const textChannel = channel as TextChannel;
+    const botPerms = textChannel.permissionsFor?.(interaction.client.user?.id);
+    const permFlags = {
+      viewChannel: !!botPerms?.has(PermissionFlagsBits.ViewChannel),
+      readMessageHistory: !!botPerms?.has(
+        PermissionFlagsBits.ReadMessageHistory,
+      ),
+      addReactions: !!botPerms?.has(PermissionFlagsBits.AddReactions),
+    };
+    console.log(
+      `[update-reports] guild=${interaction.guildId} channel=${channel.id} ` +
+        `name="${textChannel.name}" type=${textChannel.type} limit=${limit} ` +
+        `perms=${JSON.stringify(permFlags)}`,
+    );
+
+    // ── Fetch messages (same safe pagination as /backfill) ──
+    let messages: Map<string, Message>;
+    try {
+      messages = await fetchChannelHistory(textChannel, limit);
+    } catch (err) {
+      console.error(
+        `[update-reports] guild=${interaction.guildId} channel=${channel.id} fetch failed:`,
+        err,
+      );
+      channelsFailed++;
+      perChannelLines.push(
+        `❌ <#${channel.id}> — could not read message history (check LittleBot's **Read Message History** permission there)`,
+      );
+      continue;
+    }
+    console.log(
+      `[update-reports] guild=${interaction.guildId} channel=${channel.id} fetched=${messages.size} messages`,
+    );
+
+    // ── Import with the same raw-retention/parse/dedupe rules as /backfill ──
+    const counters = newImportCounters();
+    for (const [, message] of messages) {
+      await importMessage(message, counters, 50);
+    }
+
+    totals.scanned += counters.scanned;
+    totals.imported += counters.imported;
+    totals.skipped += counters.skipped;
+    channelsOk++;
+    if (counters.imported > 50) anyImportedOver50 = true;
+
+    console.log(
+      `[update-reports] guild=${interaction.guildId} channel=${channel.id} ` +
+        `scanned=${counters.scanned} imported=${counters.imported} skipped=${counters.skipped} ` +
+        `byReason=${JSON.stringify(counters.skipReasons)}`,
+    );
+
+    perChannelLines.push(
+      `✅ <#${channel.id}> — scanned ${counters.scanned}, imported ${counters.imported}, skipped ${counters.skipped}`,
+    );
+  }
+
+  const lines = [
+    "📊 **Report Update Complete**",
+    "",
+    ...perChannelLines,
+    "",
+    `**Totals:** ${channelsOk} channel(s) updated, ${channelsFailed} failed — ` +
+      `scanned ${totals.scanned}, imported ${totals.imported}, skipped ${totals.skipped}`,
+  ];
+  if (anyImportedOver50) {
+    lines.push(
+      "",
+      `_✅ reactions were only applied to the first 50 imported messages per channel to avoid rate limits._`,
     );
   }
 
@@ -469,6 +677,7 @@ const handlerMap: Record<
   report: handleReport,
   status: handleStatus,
   backfill: handleBackfill,
+  "update-reports": handleUpdateReports,
 };
 
 export async function routeCommand(
