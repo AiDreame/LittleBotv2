@@ -1,4 +1,10 @@
 import type { ParsedReport } from "@salesrecon/types";
+import {
+  buildModelMatcher,
+  classifyModelEvidence,
+} from "@salesrecon/shared";
+import type { ModelMatchStatus } from "@salesrecon/shared";
+import roster from "@salesrecon/shared/src/model-roster.json";
 
 // ── Patterns ──
 
@@ -55,6 +61,18 @@ const EARNINGS_RE =
   /\b(?:total\s+)?earnings?\s*(?:[-:–—]+\s*){0,2}(?:[€$]\s*)?\(?\s*([\d,.]+)\s*\)?\s*(?:[€$])?/i;
 // Conservative model extraction: only accept an explicit Model/Model name label.
 const MODEL_RE = /(?:model(?:\s+name)?|performer)\s*[:=-]\s*([^\n|,]+)/i;
+
+// Shared canonical-roster matcher (built once; the roster is a static data file).
+const modelMatcher = buildModelMatcher(roster);
+
+/** Model classification for a message; canonical name or null (= Unknown). */
+function classifyModel(content: string): {
+  modelName: string | null;
+  modelMatch: ModelMatchStatus;
+} {
+  const result = classifyModelEvidence(modelMatcher, content);
+  return { modelName: result.modelName, modelMatch: result.status };
+}
 
 function extractModelName(text: string): string | null {
   const value = text.match(MODEL_RE)?.[1]?.trim();
@@ -216,6 +234,7 @@ export function classifyLogoutMessage(
         shift_start: formatShiftDate(date, "00:00"),
         shift_end: formatShiftDate(date, "23:59"),
         model_name: null,
+        model_match: "none",
         earnings_source: "inferred_zero",
       },
     };
@@ -229,7 +248,7 @@ export function classifyLogoutMessage(
       reported_tips: 0,
       shift_start: formatShiftDate(date, "00:00"),
       shift_end: formatShiftDate(date, "23:59"),
-      model_name: extractModelName(content),
+      ...classifyModel(content),
     },
   };
 }
@@ -277,7 +296,7 @@ export function parseLogoutMessage(
     reported_tips: tips ?? 0,
     shift_start: normalizeTime(timeRange[0]),
     shift_end: normalizeTime(timeRange[1]),
-    model_name: extractModelName(content),
+    ...classifyModel(content),
   };
 }
 

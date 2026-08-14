@@ -69,8 +69,18 @@ export interface ParsedReport {
   reported_tips: number;
   shift_start: string;
   shift_end: string;
-  /** Only populated when the source explicitly labels a model; otherwise null. */
+  /**
+   * Canonical model name when the source explicitly labels a model or the
+   * message unambiguously matches one canonical roster name; null = Unknown
+   * (ambiguous or no evidence).
+   */
   model_name?: string | null;
+  /**
+   * Model classification outcome: "explicit" (Model:/Performer: label),
+   * "roster" (single canonical roster match), "ambiguous" (multiple distinct
+   * roster names), "none" (no evidence).
+   */
+  model_match?: "explicit" | "roster" | "ambiguous" | "none";
   /** Whether zero earnings were explicit or inferred from a clear logout without an amount. */
   earnings_source?: "explicit" | "inferred_zero";
 }

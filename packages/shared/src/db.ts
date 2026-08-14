@@ -173,4 +173,10 @@ function runMigrations(database: Database.Database): void {
     database.exec("ALTER TABLE reports ADD COLUMN earnings_source TEXT NOT NULL DEFAULT 'explicit'");
   }
   database.exec("CREATE INDEX IF NOT EXISTS idx_reports_earnings_source ON reports(earnings_source)");
+  const matchColumns = database.prepare("PRAGMA table_info(reports)").all() as Array<{name: string}>;
+  if (!matchColumns.some((c) => c.name === "model_match")) {
+    // Model classification outcome: explicit | roster | ambiguous | none | NULL (legacy/unclassified).
+    database.exec("ALTER TABLE reports ADD COLUMN model_match TEXT");
+  }
+  database.exec("CREATE INDEX IF NOT EXISTS idx_reports_model_match ON reports(model_match)");
 }
