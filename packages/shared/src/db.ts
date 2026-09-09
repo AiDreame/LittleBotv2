@@ -161,6 +161,25 @@ function runMigrations(database: Database.Database): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_chatter_events_time ON chatter_events(chatter_id, occurred_at);
+
+    -- Payout-check MVP: every /payout-check run leaves one history row.
+    -- Stores login health only (verdict + reason + final URL/title + optional
+    -- short payout hint); never amounts, cookies, or credential material.
+    CREATE TABLE IF NOT EXISTS payout_checks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      requested_by TEXT NOT NULL,
+      dicloak_profile_id TEXT NOT NULL,
+      verdict TEXT NOT NULL CHECK (verdict IN ('ok','login_required','error','dry_run')),
+      reason TEXT NOT NULL DEFAULT '',
+      final_url TEXT NOT NULL DEFAULT '',
+      page_title TEXT NOT NULL DEFAULT '',
+      payout_hint TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_payout_checks_time ON payout_checks(created_at);
+    CREATE INDEX IF NOT EXISTS idx_payout_checks_profile ON payout_checks(dicloak_profile_id, created_at);
   `);
   // Safe additive migrations for databases created before analytics foundation.
   const reportColumns = database.prepare("PRAGMA table_info(reports)").all() as Array<{name: string}>;
