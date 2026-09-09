@@ -97,6 +97,18 @@ export const commands = [
         .setMaxValue(5000)
         .setRequired(false),
     ),
+
+  new Builder()
+    .setName("payout-check")
+    .setDescription("Open a DICloak profile and check Maloum payout login health")
+    .addStringOption((opt) =>
+      opt
+        .setName("profile")
+        .setDescription("DICloak profile (environment) id to open, e.g. from DICloak profile list")
+        .setRequired(true)
+        .setMinLength(1)
+        .setMaxLength(200),
+    ),
 ];
 
 // ── Command Handlers ──
@@ -944,6 +956,83 @@ async function runUpdateReportsJob(
 
 // ── Command Router ──
 
+export async function handlePayoutCheck(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  // Defer immediately: opening a profile browser + navigation takes far
+  // longer than the 3-second interaction window.
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // Same gate as /backfill and /update-reports.
+  if (
+    !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
+  ) {
+    await interaction.editReply({
+      content:
+        "❌ You need the **Manage Server** permission to use this command.",
+    });
+    return;
+  }
+
+  if (!interaction.guildId) {
+    await interaction.editReply({
+      content: "❌ This command can only be used in a server.",
+    });
+    return;
+  }
+
+  const profileId = interaction.options.getString("profile", true).trim();
+  if (!profileId) {
+    await interaction.editReply({
+      content: "❌ Provide a DICloak profile id (see the profile list in DICloak).",
+    });
+    return;
+  }
+
+  // One payout check per guild at a time — shares the async-job pattern and
+  // keeps the single global DICloak rate limiter uncontended.
+  if (activeScanJobs.get(interaction.guildId)) {
+    await interaction.editReply({
+      content:
+        "⏳ A bot job is already running in this server. Wait for it to finish, then try again.",
+    });
+    return;
+  }
+  activeScanJobs.set(interaction.guildId, true);
+
+  // Optional pre-flight: warn when the id is not in the profile list.
+  // The open call stays authoritative (list is first-page only).
+  const { preflightProfileExists, runPayoutCheckJob } = await import("./payout-job.js");
+  const preflight = await preflightProfileExists(profileId);
+  if (preflight) {
+    activeScanJobs.delete(interaction.guildId);
+    await interaction.editReply({ content: `⚠️ ${preflight}` });
+    return;
+  }
+
+  await interaction
+    .editReply({
+      content:
+        `⏳ **Payout check started** — opening DICloak profile \`${profileId}\` ` +
+        `and navigating to the Maloum payout page. ` +
+        `Progress and the result will appear in <#${interaction.channelId}>.`,
+    })
+    .catch(() => {});
+
+  void (async (): Promise<void> => {
+    try {
+      await runPayoutCheckJob(interaction, profileId);
+    } catch (err) {
+      console.error(
+        `[payout-check] guild=${interaction.guildId} job failed:`,
+        err instanceof Error ? err.message : err,
+      );
+    } finally {
+      activeScanJobs.delete(interaction.guildId!);
+    }
+  })();
+}
+
 const handlerMap: Record<
   string,
   (interaction: ChatInputCommandInteraction) => Promise<void>
@@ -956,6 +1045,7 @@ const handlerMap: Record<
   status: handleStatus,
   backfill: handleBackfill,
   "update-reports": handleUpdateReports,
+  "payout-check": handlePayoutCheck,
 };
 
 export async function routeCommand(
